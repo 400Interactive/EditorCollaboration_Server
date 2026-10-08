@@ -1,0 +1,23 @@
+# systemd unit: starts the server at boot and restarts it if it crashes. See docs/linux.md.
+#   sudo install -m 755 collab-server-linux-amd64 /opt/editor-collab/collab-server
+#   sudo install -m 600 /dev/null /etc/editor-collab.env && sudoedit /etc/editor-collab.env   # COLLAB_PASSWORD=...
+#   sudo cp collab-server.service /etc/systemd/system/
+#   sudo systemctl enable --now collab-server
+#   journalctl -u collab-server -f      # logs
+[Unit]
+Description=Editor Collaboration server (Unreal Engine plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/editor-collab/collab-server -data /var/lib/editor-collab
+Environment=COLLAB_PORT=7878
+# Holds COLLAB_PASSWORD; readable by root only, unlike this unit file.
+EnvironmentFile=/etc/editor-collab.env
+DynamicUser=yes
+StateDirectory=editor-collab
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

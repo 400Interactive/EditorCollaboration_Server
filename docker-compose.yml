@@ -1,0 +1,18 @@
+services:
+  collab-server:
+    build: .
+    image: editor-collaboration-server:latest
+    restart: unless-stopped
+    ports:
+      - "7878:7878"
+    environment:
+      # Change this. Every collaborator enters it in Editor Preferences > Plugins > Editor Collaboration (personnel).
+      COLLAB_PASSWORD: "change-me"
+      COLLAB_PORT: "7878"
+      COLLAB_MAX_ROOM_CLIENTS: "64"
+    volumes:
+      # Database (collab.db): chat history, comments and modified files.
+      - collab-data:/data
+
+volumes:
+  collab-data:

@@ -1,0 +1,5 @@
+# Reverse proxy with automatic HTTPS (Let's Encrypt) for Internet use.
+# Clients then use: wss://collab.example.com/ws
+collab.example.com {
+	reverse_proxy 127.0.0.1:7878
+}
