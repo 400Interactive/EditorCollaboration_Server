@@ -47,7 +47,7 @@ Every option exists as a command-line argument and as an environment variable.
 | Argument | Variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `-addr` | `COLLAB_HOST`, `COLLAB_PORT` | `:7878` (all interfaces) | Listen address and port |
-| `-password` | `COLLAB_PASSWORD` | empty | Password required from clients (strongly recommended) |
+| `-password` | `COLLAB_PASSWORD` | empty | Password required from clients. Startup fails if it is empty unless `-addr` is loopback only (`127.0.0.1` or `::1`). Use `COLLAB_HOST=127.0.0.1` behind a TLS proxy. |
 | `-data` | `COLLAB_DATA_DIR` | `data` (relative to the current directory) | Database `collab.db`, logs, control file |
 | `-log` | `COLLAB_LOG_FILE` | empty (`<data>/server.log` with `-detach`) | Also write the logs to a file |
 | `-tls-cert`, `-tls-key` | `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | empty | Direct HTTPS (`wss://`), see [internet.md](docs/internet.md) |
@@ -57,6 +57,12 @@ Every option exists as a command-line argument and as an environment variable.
 | `-detach` | | | Start in the background without a window, then return |
 | `-stop` | | | Cleanly stop the server that uses the same `-data` |
 | `-healthcheck` | | | Exit code 0 if the local server answers (monitoring) |
+| `-check-update` | | | Print whether a newer GitHub release exists, then exit (0 up to date, 2 if one is available) |
+| `-update` | | | Download the latest GitHub release and replace this executable |
+| `-auto-update` | `COLLAB_AUTO_UPDATE=1` | off | Install a newer release when the periodic check finds one |
+| | `COLLAB_UPDATE_CHECK=0` | on | Skip the periodic check and its log line |
+| | `COLLAB_UPDATE_INTERVAL` | `24h` | How often to check GitHub (for example `12h`) |
+| | `COLLAB_GITHUB_REPO` | `400Interactive/EditorCollaboration_Server` | Release repository (`owner/name`) |
 
 `-data` is relative to the directory the server is started from: a double-click, a shortcut or a scheduled task
 do not necessarily use the same one. Always give an absolute path, and the same one to `-detach` and `-stop`.

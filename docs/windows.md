@@ -32,7 +32,8 @@ C:\EditorCollab\collab-server.exe -stop -data C:\EditorCollab\data
 The logs go to `C:\EditorCollab\data\server.log`.
 
 The server shows up among the **hidden icons** of the taskbar (the arrow next to the clock). Hover: number of
-connected collaborators. Click: **Open logs**, **Open data folder**, **Stop server**. To keep it always visible,
+connected collaborators. Click: **Open logs**, **Open data folder**, **Stop server**. When a newer release exists,
+the menu adds **Install update** and a balloon appears. To keep it always visible,
 drag the icon from the hidden area onto the taskbar.
 
 ## 3. Open the firewall

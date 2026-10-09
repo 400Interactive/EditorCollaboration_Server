@@ -27,10 +27,20 @@ To restore: with the server stopped, replace `collab.db` with the copy and delet
 ## Updating
 
 The plugin and the server exchange a protocol number. If they do not match, the plugin shows "The plugin and
-server versions are incompatible: update one of them." After updating the plugin:
+server versions are incompatible: update one of them."
 
-1. rebuild the server (`build.ps1` / `build.sh`, or `docker compose up -d --build`);
-2. stop the old server, replace the executable, start it again with the same options.
+On startup, and then once a day, the server asks GitHub whether [a newer release](https://github.com/400Interactive/EditorCollaboration_Server/releases) exists. It only writes a log line (and, on Windows, a notification). Nothing is downloaded until you ask:
+
+```sh
+collab-server -update
+collab-server -check-update
+```
+
+`-update` checks the `SHA256SUMS` file published with the release, replaces the executable, and restarts the systemd service when that service is already running. The database is kept. On Debian, from this repository, `sudo sh deploy/install-debian.sh --update` does the same thing. Once the script has been downloaded on its own, the command stays `sudo sh install-debian.sh --update`. Set `COLLAB_AUTO_UPDATE=1` while installing to download and restart once a day. `COLLAB_UPDATE_CHECK=0` turns the check off.
+
+In the Unreal editor, the Collaborators panel and a toast report a server update and a plugin update. The plugin link opens `MarketplaceURL` from the `.uplugin` that was current when the release was built. **Notify Server Update** and **Notify Plugin Update** in the personal plugin settings turn each toast off.
+
+A Docker container only logs that a release exists. Update it with `docker compose up -d --build`.
 
 The `collab.db` database is kept as is. The `room-*.json` files of version 1.1 and earlier are imported on the
 first start, then renamed to `.imported`.

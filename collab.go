@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"time"
@@ -52,11 +53,59 @@ func (c *client) newMessage(text string) chatMessage {
 	}
 }
 
+// delivery is a broadcast prepared under server.mu and sent after the lock is released.
+// The JSON is built while the lock is held so a later edit cannot change the bytes.
+type delivery struct {
+	recipients []*client
+	message    []byte
+}
+
+func queueBroadcast(rm *room, senderID string, payload any, batch *[]delivery) {
+	if rm == nil || batch == nil {
+		return
+	}
+	recipients := make([]*client, 0, len(rm.clients))
+	for id, other := range rm.clients {
+		if senderID == "" || id != senderID {
+			recipients = append(recipients, other)
+		}
+	}
+	*batch = append(*batch, delivery{recipients: recipients, message: mustJSON(payload)})
+}
+
+func deliver(batch []delivery) {
+	for _, item := range batch {
+		for _, other := range item.recipients {
+			other.enqueue(item.message)
+		}
+	}
+}
+
+// authoredBy is true for the client that created the message. authorId wins; a legacy row with an empty id
+// still matches the display name it was stored with.
+func authoredBy(message chatMessage, c *client) bool {
+	if message.AuthorID != "" {
+		return message.AuthorID == c.id
+	}
+	return message.Author == c.name
+}
+
 // handleCollab processes chat and comment messages. Everything is broadcast to the whole room, sender included,
 // so that every client shows the server-assigned ids and timestamps.
 func (s *server) handleCollab(c *client, msg inbound) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var batch []delivery
+	s.applyCollab(c, msg, &batch)
+	var writes []func(*sql.Tx) error
+	if c.room != nil && c.room.data != nil {
+		writes = c.room.data.takePending()
+	}
+	s.mu.Unlock()
+	s.persist(writes)
+	deliver(batch)
+}
+
+func (s *server) applyCollab(c *client, msg inbound, batch *[]delivery) {
 	if c.room == nil {
 		return
 	}
@@ -70,12 +119,16 @@ func (s *server) handleCollab(c *client, msg inbound) {
 		}
 		message := c.newMessage(text)
 		data.addChat(message)
-		s.broadcastLocked(c.room, "", mustJSON(map[string]any{"type": "chat", "message": message}))
+		queueBroadcast(c.room, "", map[string]any{"type": "chat", "message": message}, batch)
 
 	case "comment.create":
 		text, ok := cleanText(msg.Text)
 		if !ok || !validAnchor(msg.Anchor) {
 			c.enqueue(errorMessage("comment", "invalid", "Invalid comment."))
+			return
+		}
+		if len(data.Comments) >= maxCommentsPerRoom {
+			c.enqueue(errorMessage("comment", "full", "This room has too many comments."))
 			return
 		}
 		thread := &comment{
@@ -85,7 +138,7 @@ func (s *server) handleCollab(c *client, msg inbound) {
 			Messages:  []chatMessage{c.newMessage(text)},
 		}
 		data.addComment(thread)
-		s.broadcastComment(c.room, thread)
+		queueBroadcast(c.room, "", map[string]any{"type": "comment", "comment": thread}, batch)
 
 	case "comment.reply":
 		text, ok := cleanText(msg.Text)
@@ -95,7 +148,7 @@ func (s *server) handleCollab(c *client, msg inbound) {
 		}
 		thread.Messages = append(thread.Messages, c.newMessage(text))
 		data.saveComment(thread, false)
-		s.broadcastComment(c.room, thread)
+		queueBroadcast(c.room, "", map[string]any{"type": "comment", "comment": thread}, batch)
 
 	case "comment.resolve":
 		thread, _ := data.findComment(msg.ID)
@@ -104,7 +157,7 @@ func (s *server) handleCollab(c *client, msg inbound) {
 		}
 		thread.Resolved = *msg.Resolved
 		data.saveComment(thread, false)
-		s.broadcastComment(c.room, thread)
+		queueBroadcast(c.room, "", map[string]any{"type": "comment", "comment": thread}, batch)
 
 	case "comment.move":
 		thread, _ := data.findComment(msg.ID)
@@ -113,7 +166,7 @@ func (s *server) handleCollab(c *client, msg inbound) {
 		}
 		thread.Anchor = append(json.RawMessage(nil), msg.Anchor...)
 		data.saveComment(thread, false)
-		s.broadcastComment(c.room, thread)
+		queueBroadcast(c.room, "", map[string]any{"type": "comment", "comment": thread}, batch)
 
 	case "ping":
 		if !validAnchor(msg.Anchor) {
@@ -123,37 +176,65 @@ func (s *server) handleCollab(c *client, msg inbound) {
 		if seconds < 10 || seconds > 20 {
 			seconds = 15
 		}
-		s.broadcastLocked(c.room, "", mustJSON(map[string]any{
+		queueBroadcast(c.room, "", map[string]any{
 			"type": "ping", "id": newID(), "anchor": json.RawMessage(msg.Anchor),
 			"authorId": c.id, "author": c.name, "color": stateString(c.state, "color"),
 			"at": time.Now().UnixMilli(), "seconds": seconds,
-		}))
+		}, batch)
 
 	case "asset.modify":
 		record, ok := c.newAssetRecord(msg)
+		if !ok || !data.upsertAsset(record) {
+			return
+		}
+		queueBroadcast(c.room, "", map[string]any{"type": "assetModified", "record": record}, batch)
+
+	case "asset.clear":
+		if !validPackageName(msg.Package) {
+			return
+		}
+		record, ok := data.removeAsset(msg.Package, c.id)
 		if !ok {
 			return
 		}
-		data.upsertAsset(record)
-		s.broadcastLocked(c.room, "", mustJSON(map[string]any{"type": "assetModified", "record": record}))
+		queueBroadcast(c.room, "", map[string]any{"type": "assetCleared", "package": msg.Package, "author": record.Author}, batch)
 
-	case "asset.clear":
-		if !validPackageName(msg.Package) || !data.removeAsset(msg.Package, c.name) {
+	case "comment.edit":
+		text, ok := cleanText(msg.Text)
+		thread, _ := data.findComment(msg.ID)
+		if !ok || thread == nil {
+			if !ok {
+				c.enqueue(errorMessage("comment", "invalid", "Invalid comment."))
+			}
 			return
 		}
-		s.broadcastLocked(c.room, "", mustJSON(map[string]any{"type": "assetCleared", "package": msg.Package, "author": c.name}))
+		for i := range thread.Messages {
+			if thread.Messages[i].ID != msg.MessageID {
+				continue
+			}
+			if !authoredBy(thread.Messages[i], c) {
+				c.enqueue(errorMessage("comment", "notMessageAuthor", "Only the author can edit this message."))
+				return
+			}
+			thread.Messages[i].Text = text
+			thread.Messages[i].EditedAt = time.Now().UnixMilli()
+			data.saveComment(thread, false)
+			queueBroadcast(c.room, "", map[string]any{"type": "comment", "comment": thread}, batch)
+			return
+		}
 
 	case "comment.delete":
 		thread, index := data.findComment(msg.ID)
 		if thread == nil {
 			return
 		}
-		if len(thread.Messages) > 0 && thread.Messages[0].Author != c.name {
+		if len(thread.Messages) == 0 || !authoredBy(thread.Messages[0], c) {
 			c.enqueue(errorMessage("comment", "notAuthor", "Only the author can delete this comment."))
 			return
 		}
+		id := thread.ID
 		data.deleteComment(index)
-		s.broadcastLocked(c.room, "", mustJSON(map[string]any{"type": "commentDeleted", "id": thread.ID}))
+		queueBroadcast(c.room, "", map[string]any{"type": "commentDeleted", "id": id}, batch)
 	}
 }
 
@@ -186,10 +267,6 @@ func (c *client) newAssetRecord(msg inbound) (assetRecord, bool) {
 		Color:    stateString(c.state, "color"),
 		At:       time.Now().UnixMilli(),
 	}, true
-}
-
-func (s *server) broadcastComment(rm *room, thread *comment) {
-	s.broadcastLocked(rm, "", mustJSON(map[string]any{"type": "comment", "comment": thread}))
 }
 
 // errorMessage carries codes that clients translate; message is an English fallback.

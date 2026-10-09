@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -44,6 +47,11 @@ const (
 	messagesPerSecond = 30.0
 	messageBurst      = 60.0
 	maxDroppedInARow  = 300
+
+	// A presence value larger than this is dropped. The whole frame is already limited by maxMessageBytes.
+	maxPresenceFieldBytes = 8 << 10
+	maxConnections        = 256
+	maxRooms              = 64
 )
 
 // Presence fields a client may share. Anything else is discarded.
@@ -62,6 +70,7 @@ type config struct {
 	dataDir        string
 	logFile        string
 	noTray         bool
+	autoUpdate     bool
 }
 
 type server struct {
@@ -76,6 +85,19 @@ type server struct {
 	controlToken      string
 	shutdownRequested chan struct{}
 	shutdownOnce      sync.Once
+
+	updateChecked   bool
+	updateAvailable bool
+	latestVersion   string
+	releasePage     string
+	announced       string
+	restartOnExit   bool
+	autoUpdate      bool
+
+	updateMu   sync.Mutex
+	updateBusy bool
+
+	conns atomic.Int32
 }
 
 type command int
@@ -85,6 +107,8 @@ const (
 	commandHealthcheck
 	commandDetach
 	commandStop
+	commandCheckUpdate
+	commandApplyUpdate
 )
 
 // room exists while at least one client is in it; its data is loaded on the first join and dropped with it.
@@ -114,6 +138,7 @@ type inbound struct {
 	State           map[string]json.RawMessage `json:"state"`
 	Text            string                     `json:"text"`
 	ID              string                     `json:"id"`
+	MessageID       string                     `json:"messageId"`
 	Anchor          json.RawMessage            `json:"anchor"`
 	Resolved        *bool                      `json:"resolved"`
 	Package         string                     `json:"package"`
@@ -131,6 +156,7 @@ type peerEntry struct {
 }
 
 func main() {
+	loadPluginDescriptor()
 	cfg, cmd := parseConfig()
 	switch cmd {
 	case commandHealthcheck:
@@ -139,6 +165,10 @@ func main() {
 		os.Exit(runDetached(cfg))
 	case commandStop:
 		os.Exit(runStop(cfg))
+	case commandCheckUpdate:
+		os.Exit(runCheckUpdate())
+	case commandApplyUpdate:
+		os.Exit(runApplyUpdate())
 	}
 	os.Exit(run(cfg))
 }
@@ -148,6 +178,7 @@ func run(cfg config) int {
 	srv := &server{
 		cfg: cfg, passwordHash: sha256.Sum256([]byte(cfg.password)), rooms: map[string]*room{},
 		controlToken: newControlToken(), shutdownRequested: make(chan struct{}),
+		autoUpdate: cfg.autoUpdate,
 	}
 	if err := os.MkdirAll(cfg.dataDir, 0o750); err != nil {
 		log.Print(err)
@@ -167,15 +198,24 @@ func run(cfg config) int {
 	defer db.close()
 	srv.db = db
 
+	if cfg.password == "" && !listenHostIsLoopback(cfg.addr) {
+		log.Print(T("server.passwordRequired"))
+		return 1
+	}
+
 	listener, err := net.Listen("tcp", cfg.addr)
 	if err != nil {
 		log.Printf("server error: %v", err)
 		return 1
 	}
 
+	// ReadTimeout and WriteTimeout stay unset: they survive Hijack and would drop live WebSockets.
+	// Short routes get their own deadlines in limitRequest. Accept also clears any leftover deadline.
 	httpServer := &http.Server{
 		Handler:           httpHandler(srv),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16,
 	}
 
 	scheme := "ws"
@@ -202,6 +242,9 @@ func run(cfg config) int {
 
 	removeTray := startTray(srv)
 	defer removeTray()
+	if updatesEnabled() {
+		go srv.watchUpdates()
+	}
 
 	// Ctrl+C, closing the terminal window, SIGTERM from systemd or Docker, -stop and the tray menu all end up here.
 	signals := make(chan os.Signal, 1)
@@ -227,6 +270,12 @@ func run(cfg config) int {
 	}
 	db.close()
 	log.Print(T("server.stopped"))
+	srv.mu.Lock()
+	restart := srv.restartOnExit
+	srv.mu.Unlock()
+	if restart && exitCode == 0 {
+		reexec()
+	}
 	return exitCode
 }
 
@@ -242,7 +291,69 @@ func httpHandler(srv *server) http.Handler {
 		}
 		fmt.Fprintf(w, "Editor Collaboration server %s - WebSocket endpoint: /ws\n", version)
 	})
-	return mux
+	return limitRequest(mux)
+}
+
+// limitRequest bounds ordinary HTTP requests. WebSocket upgrades are excluded: a read deadline
+// left on the hijacked connection would close the session.
+func limitRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws" {
+			deadline := time.Now().Add(15 * time.Second)
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(deadline)
+			_ = rc.SetWriteDeadline(deadline)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// clearDeadlines strips the deadlines http.Server may have set, once the WebSocket hijacks the connection.
+type clearDeadlines struct {
+	http.ResponseWriter
+	http.Hijacker
+}
+
+func (c clearDeadlines) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := c.Hijacker.Hijack()
+	if conn != nil {
+		_ = conn.SetDeadline(time.Time{})
+	}
+	return conn, rw, err
+}
+
+// listenHostIsLoopback reports whether addr accepts connections only from this machine.
+// An empty host (":7878") listens on every interface.
+func listenHostIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = strings.Trim(addr, "[]")
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *server) tryAcquireConn() bool {
+	for {
+		current := s.conns.Load()
+		if current >= maxConnections {
+			return false
+		}
+		if s.conns.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (s *server) releaseConn() {
+	s.conns.Add(-1)
 }
 
 func parseConfig() (config, command) {
@@ -262,15 +373,22 @@ func parseConfig() (config, command) {
 	flag.StringVar(&cfg.dataDir, "data", envOr("COLLAB_DATA_DIR", "data"), "directory of the database (collab.db) and of the control file (env COLLAB_DATA_DIR)")
 	flag.StringVar(&cfg.logFile, "log", os.Getenv("COLLAB_LOG_FILE"), "also write the logs to this file (env COLLAB_LOG_FILE; -detach defaults to <data>/server.log)")
 	flag.BoolVar(&cfg.noTray, "no-tray", envOr("COLLAB_NO_TRAY", "") == "1", "Windows: no icon in the notification area of the taskbar (env COLLAB_NO_TRAY=1)")
+	flag.BoolVar(&cfg.autoUpdate, "auto-update", envTruthy("COLLAB_AUTO_UPDATE"), "install a newer GitHub release when one is found (env COLLAB_AUTO_UPDATE=1)")
 	healthcheck := flag.Bool("healthcheck", false, "query /health on the local server and exit (for container health checks)")
 	detach := flag.Bool("detach", false, "run in the background, without console window, and return once the server answers")
 	stop := flag.Bool("stop", false, "stop the server running with the same data directory, after it saved its data")
+	checkUpdate := flag.Bool("check-update", false, "print whether a newer GitHub release exists, then exit")
+	applyUpdate := flag.Bool("update", false, "download the latest GitHub release and replace this executable")
 	flag.Parse()
 
 	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
 		log.Fatal(T("server.tlsBoth"))
 	}
 	switch {
+	case *checkUpdate:
+		return cfg, commandCheckUpdate
+	case *applyUpdate:
+		return cfg, commandApplyUpdate
 	case *healthcheck:
 		return cfg, commandHealthcheck
 	case *stop:
@@ -279,6 +397,15 @@ func parseConfig() (config, command) {
 		return cfg, commandDetach
 	}
 	return cfg, commandRun
+}
+
+func envTruthy(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func envOr(key, fallback string) string {
@@ -315,15 +442,46 @@ func (s *server) counts() (clients, rooms int) {
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	clients, rooms := s.counts()
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	s.mu.Lock()
+	checked, available, latest, page := s.updateChecked, s.updateAvailable, s.latestVersion, s.releasePage
+	s.mu.Unlock()
+
+	payload := map[string]any{
 		"status": "ok", "version": version, "protocolVersion": protocolVersion,
 		"rooms": rooms, "clients": clients,
-	})
+	}
+	if pluginVersion != "" {
+		payload["pluginVersion"] = pluginVersion
+	}
+	if pluginMarketplaceURL != "" {
+		payload["marketplaceUrl"] = pluginMarketplaceURL
+	}
+	if checked {
+		payload["updateAvailable"] = available
+		if latest != "" {
+			payload["latestVersion"] = latest
+		}
+		if page != "" {
+			payload["releaseUrl"] = page
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+	if !s.tryAcquireConn() {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.releaseConn()
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "websocket unsupported", http.StatusInternalServerError)
+		return
+	}
+	conn, err := websocket.Accept(clearDeadlines{ResponseWriter: w, Hijacker: hj}, r, &websocket.AcceptOptions{
 		// Unreal clients send no browser Origin; access is controlled by the password instead.
 		InsecureSkipVerify: true,
 	})
@@ -400,6 +558,10 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 		}
 		s.mu.Lock()
 		if rm = s.rooms[roomName]; rm == nil {
+			if len(s.rooms) >= maxRooms {
+				s.mu.Unlock()
+				return nil, reject(conn, "full", "The server is hosting too many rooms.")
+			}
 			rm = &room{name: roomName, clients: map[string]*client{}, data: loaded}
 			s.rooms[roomName] = rm
 		}
@@ -424,8 +586,10 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 	c.enqueue(mustJSON(map[string]any{"type": "assets", "records": saved.Assets}))
 	c.room = rm
 	rm.clients[c.id] = c
-	s.broadcastLocked(rm, c.id, mustJSON(map[string]any{"type": "presence", "id": c.id, "state": c.state}))
+	var joined []delivery
+	queueBroadcast(rm, c.id, map[string]any{"type": "presence", "id": c.id, "state": c.state}, &joined)
 	s.mu.Unlock()
+	deliver(joined)
 
 	return c, nil
 }
@@ -462,7 +626,7 @@ func (c *client) readLoop(ctx context.Context, s *server) {
 		switch msg.Type {
 		case "presence":
 			s.updatePresence(c, filterState(msg.State))
-		case "chat", "comment.create", "comment.reply", "comment.resolve", "comment.move", "comment.delete", "asset.modify", "asset.clear", "ping":
+		case "chat", "comment.create", "comment.reply", "comment.resolve", "comment.move", "comment.edit", "comment.delete", "asset.modify", "asset.clear", "ping":
 			s.handleCollab(c, msg)
 		case "chat.history":
 			s.sendOlderChat(c, msg.Before)
@@ -497,54 +661,51 @@ func (s *server) updatePresence(c *client, delta map[string]json.RawMessage) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if c.room == nil {
-		return
-	}
-	for key, value := range delta {
-		if isNull(value) {
-			delete(c.state, key)
-		} else {
-			c.state[key] = value
+	var batch []delivery
+	if c.room != nil {
+		for key, value := range delta {
+			if isNull(value) {
+				delete(c.state, key)
+			} else {
+				c.state[key] = value
+			}
 		}
+		if _, ok := delta["name"]; ok {
+			c.name = displayName(c.state)
+		}
+		queueBroadcast(c.room, c.id, map[string]any{"type": "presence", "id": c.id, "state": delta}, &batch)
 	}
-	if _, ok := delta["name"]; ok {
-		c.name = displayName(c.state)
-	}
-	s.broadcastLocked(c.room, c.id, mustJSON(map[string]any{"type": "presence", "id": c.id, "state": delta}))
+	s.mu.Unlock()
+	deliver(batch)
 }
 
 func (s *server) leave(c *client) {
 	s.mu.Lock()
+	var batch []delivery
+	var writes []func(*sql.Tx) error
 	rm := c.room
 	if rm != nil {
 		if rm.data != nil {
 			for _, record := range rm.data.clearWorking(c.id) {
-				s.broadcastLocked(rm, c.id, mustJSON(map[string]any{"type": "assetModified", "record": record}))
+				queueBroadcast(rm, c.id, map[string]any{"type": "assetModified", "record": record}, &batch)
 			}
+			writes = rm.data.takePending()
 		}
 		delete(rm.clients, c.id)
 		if len(rm.clients) == 0 {
 			delete(s.rooms, rm.name)
 		} else {
-			s.broadcastLocked(rm, c.id, mustJSON(map[string]any{"type": "leave", "id": c.id}))
+			queueBroadcast(rm, c.id, map[string]any{"type": "leave", "id": c.id}, &batch)
 		}
 		c.room = nil
 	}
 	s.mu.Unlock()
+	s.persist(writes)
+	deliver(batch)
 
 	c.shutdown(websocket.StatusNormalClosure, "")
 	if rm != nil {
 		log.Print(T("server.left", rm.name, c.name, c.id))
-	}
-}
-
-// broadcastLocked queues a message for every client of the room except the sender. Requires s.mu.
-func (s *server) broadcastLocked(rm *room, senderID string, message []byte) {
-	for id, other := range rm.clients {
-		if id != senderID {
-			other.enqueue(message)
-		}
 	}
 }
 
@@ -629,7 +790,7 @@ func reject(conn *websocket.Conn, code, message string) error {
 func filterState(in map[string]json.RawMessage) map[string]json.RawMessage {
 	out := make(map[string]json.RawMessage, len(in))
 	for key, value := range in {
-		if !allowedFields[key] || len(value) == 0 {
+		if !allowedFields[key] || len(value) == 0 || len(value) > maxPresenceFieldBytes {
 			continue
 		}
 		if key == "name" || key == "color" {

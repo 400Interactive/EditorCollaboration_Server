@@ -1,0 +1,41 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.2",
+	"FriendlyName": "Editor Collaboration",
+	"Description": "Real-time collaboration in the editor: see where your teammates are (map, viewport, Blueprint, Material...), join them in one click, chat, pin comments and see which assets they changed. Editor only.",
+	"Category": "Editor",
+	"CreatedBy": "Kinj14",
+	"CreatedByURL": "https://400interactive.com/",
+	"DocsURL": "https://app.gitbook.com/o/pyX1jisZK86abtXxrbQm/sites/site_TGEKx/preview",
+	"MarketplaceURL": "https://www.fab.com/portal/listings/562248b3-2a46-4076-ba0d-b812b4d7d659/",
+	"SupportURL": "https://discord.400interactive.com/",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"LocalizationTargets": [
+		{
+			"Name": "EditorCollaboration",
+			"LoadingPolicy": "Editor"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "LevelSequenceEditor",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "EditorCollaboration",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		}
+	]
+}

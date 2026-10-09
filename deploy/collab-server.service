@@ -1,7 +1,7 @@
 # systemd unit: starts the server at boot and restarts it if it crashes. See docs/linux.md.
 #   sudo install -m 755 collab-server-linux-amd64 /opt/editor-collab/collab-server
 #   sudo install -m 600 /dev/null /etc/editor-collab.env && sudoedit /etc/editor-collab.env   # COLLAB_PASSWORD=...
-#   sudo cp collab-server.service /etc/systemd/system/
+#   sudo cp deploy/collab-server.service /etc/systemd/system/
 #   sudo systemctl enable --now collab-server
 #   journalctl -u collab-server -f      # logs
 [Unit]

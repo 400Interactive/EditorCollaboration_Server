@@ -238,10 +238,45 @@ func TestCommentLifecycleAndPersistence(t *testing.T) {
 
 	send(t, bob.conn, map[string]any{"type": "comment.reply", "id": id, "text": "Je regarde"})
 	replied := expect(t, alice.conn, "comment")["comment"].(map[string]any)
-	if messages := replied["messages"].([]any); len(messages) != 2 || messages[1].(map[string]any)["author"] != "Bob" {
+	messages := replied["messages"].([]any)
+	if len(messages) != 2 || messages[1].(map[string]any)["author"] != "Bob" {
 		t.Fatalf("unexpected thread %v", replied)
 	}
 	expect(t, bob.conn, "comment")
+	opening := messages[0].(map[string]any)
+	reply := messages[1].(map[string]any)
+	openingID, replyID := opening["id"].(string), reply["id"].(string)
+	openingAt := opening["at"]
+
+	send(t, bob.conn, map[string]any{"type": "comment.edit", "id": id, "messageId": openingID, "text": "non"})
+	if refused := expect(t, bob.conn, "error"); refused["code"] != "comment" || refused["reason"] != "notMessageAuthor" {
+		t.Fatalf("only the author may edit the opening message: %v", refused)
+	}
+
+	send(t, alice.conn, map[string]any{"type": "comment.edit", "id": id, "messageId": openingID, "text": "Revu"})
+	edited := expect(t, bob.conn, "comment")["comment"].(map[string]any)
+	expect(t, alice.conn, "comment")
+	editedOpening := edited["messages"].([]any)[0].(map[string]any)
+	if editedOpening["text"] != "Revu" || editedOpening["at"] != openingAt || editedOpening["editedAt"] == nil || len(edited["messages"].([]any)) != 2 {
+		t.Fatalf("edit should replace the text and keep the time: %v", edited)
+	}
+
+	send(t, alice.conn, map[string]any{"type": "comment.edit", "id": id, "messageId": replyID, "text": "non plus"})
+	if refused := expect(t, alice.conn, "error"); refused["code"] != "comment" || refused["reason"] != "notMessageAuthor" {
+		t.Fatalf("only the author may edit a reply: %v", refused)
+	}
+
+	send(t, bob.conn, map[string]any{"type": "comment.edit", "id": id, "messageId": replyID, "text": "Je regarde bien"})
+	bobEdit := expect(t, alice.conn, "comment")["comment"].(map[string]any)
+	expect(t, bob.conn, "comment")
+	if bobEdit["messages"].([]any)[1].(map[string]any)["text"] != "Je regarde bien" {
+		t.Fatalf("bob should edit his reply: %v", bobEdit)
+	}
+
+	send(t, alice.conn, map[string]any{"type": "comment.edit", "id": id, "messageId": openingID, "text": "   "})
+	if refused := expect(t, alice.conn, "error"); refused["code"] != "comment" {
+		t.Fatalf("empty text must be refused: %v", refused)
+	}
 
 	send(t, bob.conn, map[string]any{"type": "comment.resolve", "id": id, "resolved": true})
 	if resolved := expect(t, alice.conn, "comment")["comment"].(map[string]any); resolved["resolved"] != true {
@@ -263,6 +298,10 @@ func TestCommentLifecycleAndPersistence(t *testing.T) {
 	carol := join(t, ts2, "Hotel", "", "Carol")
 	if len(carol.comments) != 1 {
 		t.Fatalf("comments should survive a restart, got %v", carol.comments)
+	}
+	storedMessages := carol.comments[0].(map[string]any)["messages"].([]any)
+	if storedMessages[0].(map[string]any)["text"] != "Revu" || storedMessages[1].(map[string]any)["text"] != "Je regarde bien" {
+		t.Fatalf("edited text should survive a restart, got %v", carol.comments)
 	}
 
 	send(t, alice.conn, map[string]any{"type": "comment.delete", "id": id})
@@ -371,6 +410,41 @@ func TestAssetCommentIsBroadcast(t *testing.T) {
 	anchor := comment["anchor"].(map[string]any)
 	if anchor["kind"] != "asset" || anchor["package"] != "/Game/BP_Door" {
 		t.Fatalf("asset comment was not kept: %v", comment)
+	}
+}
+
+func TestListenHostIsLoopback(t *testing.T) {
+	if !listenHostIsLoopback("127.0.0.1:7878") || !listenHostIsLoopback("[::1]:7878") || !listenHostIsLoopback("localhost:7878") {
+		t.Fatal("loopback addresses should be allowed without a password")
+	}
+	if listenHostIsLoopback(":7878") || listenHostIsLoopback("0.0.0.0:7878") || listenHostIsLoopback("192.168.1.10:7878") {
+		t.Fatal("non-loopback addresses must require a password")
+	}
+}
+
+func TestSpoofedNameCannotEditOrClear(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	alice := join(t, ts, "Hotel", "", "Alice")
+	impostor := join(t, ts, "Hotel", "", "Alice")
+	expect(t, alice.conn, "presence")
+
+	send(t, alice.conn, map[string]any{"type": "comment.create", "anchor": map[string]any{"kind": "asset", "package": "/Game/BP_Door"}, "text": "Mine"})
+	created := expect(t, impostor.conn, "comment")["comment"].(map[string]any)
+	expect(t, alice.conn, "comment")
+	openingID := created["messages"].([]any)[0].(map[string]any)["id"].(string)
+
+	send(t, impostor.conn, map[string]any{"type": "comment.edit", "id": created["id"], "messageId": openingID, "text": "Stolen"})
+	if refused := expect(t, impostor.conn, "error"); refused["reason"] != "notMessageAuthor" {
+		t.Fatalf("a second client with the same display name must not edit: %v", refused)
+	}
+
+	send(t, alice.conn, map[string]any{"type": "asset.modify", "package": "/Game/BP_Door", "dirty": true})
+	expect(t, alice.conn, "assetModified")
+	expect(t, impostor.conn, "assetModified")
+	send(t, impostor.conn, map[string]any{"type": "asset.clear", "package": "/Game/BP_Door"})
+	send(t, impostor.conn, map[string]any{"type": "chat", "text": "still there"})
+	if chat := expect(t, alice.conn, "chat"); chat["message"].(map[string]any)["text"] != "still there" {
+		t.Fatalf("clearing someone else's asset must not be broadcast, got %v", chat)
 	}
 }
 

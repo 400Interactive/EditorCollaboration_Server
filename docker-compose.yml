@@ -4,10 +4,13 @@ services:
     image: editor-collaboration-server:latest
     restart: unless-stopped
     ports:
-      - "7878:7878"
+      # Loopback only. For a LAN, publish 0.0.0.0:7878:7878 and keep a real password. For the Internet, stay on
+      # loopback and terminate TLS in a reverse proxy (docs/internet.md).
+      - "127.0.0.1:7878:7878"
     environment:
-      # Change this. Every collaborator enters it in Editor Preferences > Plugins > Editor Collaboration (personnel).
-      COLLAB_PASSWORD: "change-me"
+      # Required. Every collaborator enters it in Editor Preferences > Plugins > Editor Collaboration (personal).
+      # Set it in the shell or a .env file next to this compose file. There is no default.
+      COLLAB_PASSWORD: ${COLLAB_PASSWORD:?Set COLLAB_PASSWORD}
       COLLAB_PORT: "7878"
       COLLAB_MAX_ROOM_CLIENTS: "64"
     volumes:

@@ -23,6 +23,9 @@ const (
 	databaseFileName      = "collab.db"
 	chatPageSize          = 100
 	maxMessagesPerComment = 500
+	maxCommentsPerRoom    = 2000
+	maxChatRowsPerRoom    = 10000
+	maxAssetsPerRoom      = 4000
 	assetRecordMaxAge     = 30 * 24 * time.Hour
 	writeQueueSize        = 8192
 	maxWritesPerCommit    = 1024
@@ -88,6 +91,7 @@ type chatMessage struct {
 	Color    string `json:"color"`
 	Text     string `json:"text"`
 	At       int64  `json:"at"`
+	EditedAt int64  `json:"editedAt,omitempty"`
 }
 
 type comment struct {
@@ -258,13 +262,43 @@ type roomData struct {
 	Chat         []chatMessage
 	ChatComplete bool
 	Assets       []assetRecord
+	// pending is drained by the caller after it releases server.mu, so a full write queue cannot stall every room.
+	pending []func(tx *sql.Tx) error
+}
+
+func (d *roomData) deferWrite(apply func(tx *sql.Tx) error) {
+	d.pending = append(d.pending, apply)
+}
+
+func (d *roomData) takePending() []func(tx *sql.Tx) error {
+	out := d.pending
+	d.pending = nil
+	return out
+}
+
+func (s *server) persist(writes []func(tx *sql.Tx) error) {
+	if s == nil || s.db == nil {
+		return
+	}
+	for _, apply := range writes {
+		s.db.enqueue(apply)
+	}
 }
 
 // loadRoom reads a room from the database. Called without server.mu.
 func (d *database) loadRoom(name string) (*roomData, error) {
 	cutoff := time.Now().Add(-assetRecordMaxAge).UnixMilli()
 	d.enqueue(func(tx *sql.Tx) error {
-		_, err := tx.Exec(`DELETE FROM assets WHERE room = ? AND at < ?`, name, cutoff)
+		if _, err := tx.Exec(`DELETE FROM assets WHERE room = ? AND at < ?`, name, cutoff); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`DELETE FROM comments WHERE room = ? AND seq NOT IN (
+			SELECT seq FROM comments WHERE room = ? ORDER BY seq DESC LIMIT ?)`, name, name, maxCommentsPerRoom)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DELETE FROM chat WHERE room = ? AND seq NOT IN (
+			SELECT seq FROM chat WHERE room = ? ORDER BY seq DESC LIMIT ?)`, name, name, maxChatRowsPerRoom)
 		return err
 	})
 	// Includes the writes of a previous session of the same room that may still be queued.
@@ -365,7 +399,14 @@ func (d *roomData) addChat(m chatMessage) {
 		d.ChatComplete = false
 	}
 	room := d.name
-	d.db.enqueue(func(tx *sql.Tx) error { return insertChat(tx, room, m) })
+	d.deferWrite(func(tx *sql.Tx) error {
+		if err := insertChat(tx, room, m); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`DELETE FROM chat WHERE room = ? AND seq NOT IN (
+			SELECT seq FROM chat WHERE room = ? ORDER BY seq DESC LIMIT ?)`, room, room, maxChatRowsPerRoom)
+		return err
+	})
 }
 
 func insertChat(tx *sql.Tx, room string, m chatMessage) error {
@@ -384,10 +425,10 @@ func (d *roomData) saveComment(thread *comment, isNew bool) {
 	room, id, anchor, resolved, createdAt := d.name, thread.ID, string(thread.Anchor), thread.Resolved, thread.CreatedAt
 	messages := string(mustJSON(thread.Messages))
 	if isNew {
-		d.db.enqueue(func(tx *sql.Tx) error { return insertComment(tx, room, id, anchor, resolved, createdAt, messages) })
+		d.deferWrite(func(tx *sql.Tx) error { return insertComment(tx, room, id, anchor, resolved, createdAt, messages) })
 		return
 	}
-	d.db.enqueue(func(tx *sql.Tx) error {
+	d.deferWrite(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`UPDATE comments SET anchor = ?, resolved = ?, messages = ? WHERE id = ?`, anchor, resolved, messages, id)
 		return err
 	})
@@ -402,7 +443,7 @@ func insertComment(tx *sql.Tx, room, id, anchor string, resolved bool, createdAt
 func (d *roomData) deleteComment(index int) {
 	id := d.Comments[index].ID
 	d.Comments = append(d.Comments[:index], d.Comments[index+1:]...)
-	d.db.enqueue(func(tx *sql.Tx) error {
+	d.deferWrite(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`DELETE FROM comments WHERE id = ?`, id)
 		return err
 	})
@@ -417,50 +458,77 @@ func (d *roomData) clearWorking(authorID string) []assetRecord {
 			record := d.Assets[i]
 			updated = append(updated, record)
 			room := d.name
-			d.db.enqueue(func(tx *sql.Tx) error { return upsertAsset(tx, room, record) })
+			saved := record
+			d.deferWrite(func(tx *sql.Tx) error { return upsertAsset(tx, room, saved) })
 		}
 	}
 	return updated
 }
 
-// upsertAsset keeps one record per package and author.
-func (d *roomData) upsertAsset(record assetRecord) {
+// upsertAsset keeps one record per package and author id. A display name already used by someone else is refused,
+// so renaming onto another collaborator's row cannot steal it. Requires server.mu.
+func (d *roomData) upsertAsset(record assetRecord) bool {
+	for index := range d.Assets {
+		if d.Assets[index].Package == record.Package && d.Assets[index].AuthorID != record.AuthorID && d.Assets[index].Author == record.Author {
+			return false
+		}
+	}
 	replaced := false
 	for index := range d.Assets {
-		if d.Assets[index].Package == record.Package && d.Assets[index].Author == record.Author {
+		if d.Assets[index].Package == record.Package && d.Assets[index].AuthorID == record.AuthorID {
 			d.Assets[index] = record
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
+		if len(d.Assets) >= maxAssetsPerRoom {
+			return false
+		}
 		d.Assets = append(d.Assets, record)
 	}
 	room := d.name
-	d.db.enqueue(func(tx *sql.Tx) error { return upsertAsset(tx, room, record) })
+	d.deferWrite(func(tx *sql.Tx) error { return upsertAsset(tx, room, record) })
+	return true
 }
 
 func upsertAsset(tx *sql.Tx, room string, r assetRecord) error {
-	_, err := tx.Exec(`INSERT INTO assets (room, package, author, asset, hash, dirty, working, author_id, color, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (room, package, author) DO UPDATE SET asset = excluded.asset, hash = excluded.hash, dirty = excluded.dirty,
-		working = excluded.working, author_id = excluded.author_id, color = excluded.color, at = excluded.at`,
-		room, r.Package, r.Author, r.Asset, r.Hash, r.Dirty, r.Working, r.AuthorID, r.Color, r.At)
+	result, err := tx.Exec(`UPDATE assets SET author = ?, asset = ?, hash = ?, dirty = ?, working = ?, color = ?, at = ?
+		WHERE room = ? AND package = ? AND author_id = ?`,
+		r.Author, r.Asset, r.Hash, r.Dirty, r.Working, r.Color, r.At, room, r.Package, r.AuthorID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated > 0 {
+		return nil
+	}
+	_, err = tx.Exec(`INSERT INTO assets (room, package, author, asset, hash, dirty, working, author_id, color, at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM assets WHERE room = ? AND package = ? AND author = ?)`,
+		room, r.Package, r.Author, r.Asset, r.Hash, r.Dirty, r.Working, r.AuthorID, r.Color, r.At,
+		room, r.Package, r.Author)
 	return err
 }
 
-func (d *roomData) removeAsset(pkg, author string) bool {
+// removeAsset drops the caller's own record. Requires server.mu.
+func (d *roomData) removeAsset(pkg, authorID string) (assetRecord, bool) {
 	for index := range d.Assets {
-		if d.Assets[index].Package == pkg && d.Assets[index].Author == author {
+		if d.Assets[index].Package == pkg && d.Assets[index].AuthorID == authorID {
+			record := d.Assets[index]
 			d.Assets = append(d.Assets[:index], d.Assets[index+1:]...)
 			room := d.name
-			d.db.enqueue(func(tx *sql.Tx) error {
-				_, err := tx.Exec(`DELETE FROM assets WHERE room = ? AND package = ? AND author = ?`, room, pkg, author)
+			d.deferWrite(func(tx *sql.Tx) error {
+				_, err := tx.Exec(`DELETE FROM assets WHERE room = ? AND package = ? AND author_id = ?`, room, pkg, authorID)
 				return err
 			})
-			return true
+			return record, true
 		}
 	}
-	return false
+	return assetRecord{}, false
 }
 
 // importLegacyRooms moves the room-*.json files of server versions before 1.2 into the database, once.

@@ -47,13 +47,14 @@ func hasInteractiveDesktop() bool {
 	return windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session) == nil && session != 0
 }
 
-
 type trayTexts struct {
 	clients  func(clients, rooms int) string
 	port     string
 	openLogs string
 	openData string
 	stop     string
+	install  string
+	balloon  string
 }
 
 func trayTextsFor(language string) trayTexts {
@@ -74,6 +75,8 @@ func trayTextsFor(language string) trayTexts {
 		openLogs: T("tray.openLogs"),
 		openData: T("tray.openData"),
 		stop:     T("tray.stop"),
+		install:  T("tray.installUpdate"),
+		balloon:  T("tray.updateBalloon"),
 	}
 }
 
@@ -97,11 +100,26 @@ func setupTray(s *server, texts trayTexts) {
 	dataDir, _ := filepath.Abs(s.cfg.dataDir)
 	openData := systray.AddMenuItem(texts.openData, dataDir)
 	systray.AddSeparator()
+	install := systray.AddMenuItem(fmt.Sprintf(texts.install, ""), "")
+	install.Hide()
 	stop := systray.AddMenuItem(texts.stop, "")
 
+	var balloonShown string
 	refresh := func() {
 		clients, rooms := s.counts()
 		text := texts.clients(clients, rooms)
+		latest, _, available := s.offeredUpdate()
+		if available && latest != "" {
+			text = text + " - " + fmt.Sprintf(texts.balloon, latest)
+			install.SetTitle(fmt.Sprintf(texts.install, latest))
+			install.Show()
+			if balloonShown != latest {
+				balloonShown = latest
+				showUpdateBalloon("Editor Collaboration", fmt.Sprintf(texts.balloon, latest))
+			}
+		} else {
+			install.Hide()
+		}
 		status.SetTitle(text)
 		systray.SetTooltip("Editor Collaboration - " + text)
 	}
@@ -118,6 +136,8 @@ func setupTray(s *server, texts trayTexts) {
 				shellOpen(s.cfg.logFile)
 			case <-openData.ClickedCh:
 				shellOpen(dataDir)
+			case <-install.ClickedCh:
+				s.installOfferedUpdate()
 			case <-stop.ClickedCh:
 				log.Print(T("server.stopTray"))
 				s.requestShutdown()

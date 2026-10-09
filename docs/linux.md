@@ -5,10 +5,23 @@ Nothing to install besides the executable.
 
 ## 1. Install
 
-Build on any machine (`./build.sh` or `./build.ps1`), then copy the executable to the server:
+On Debian 11, 12 or 13, one command downloads the executable from GitHub Releases and registers a systemd service.
+The repository URL below is temporary until the release assets are published
+(`collab-server-linux-amd64` and `collab-server-linux-arm64`):
 
 ```sh
-scp dist/collab-server-linux-amd64 collab-server.service me@server:~
+curl -fsSL https://raw.githubusercontent.com/400Interactive/EditorCollaboration_Server/main/deploy/install-debian.sh | sudo bash
+```
+
+The script asks for the password (or use `sudo COLLAB_PASSWORD='my-password' bash`). Re-running it updates the
+executable and keeps the existing password. `sudo sh install-debian.sh --update` only replaces the executable and
+restarts the service. `sudo COLLAB_AUTO_UPDATE=1 sh install-debian.sh` also checks GitHub once a day and installs
+a newer release; omit the variable on a later run and that daily install is turned off. Details and options: `install-debian.sh --help`.
+
+To install by hand instead, build on any machine (`./build.sh` or `./build.ps1`), then copy the executable to the server:
+
+```sh
+scp dist/collab-server-linux-amd64 deploy/collab-server.service me@server:~
 ssh me@server
 sudo install -D -m 755 ~/collab-server-linux-amd64 /opt/editor-collab/collab-server
 ```
@@ -55,9 +68,13 @@ saved). Other options (`COLLAB_PORT`, `COLLAB_MAX_ROOM_CLIENTS`...) go into `/et
 ## 4. Open the firewall
 
 ```sh
-sudo ufw allow 7878/tcp                                                           # Ubuntu, Debian (ufw)
+sudo ufw allow 7878/tcp                                                           # Debian, Ubuntu (ufw)
+sudo iptables -I INPUT -p tcp --dport 7878 -j ACCEPT                              # Debian (iptables)
 sudo firewall-cmd --permanent --add-port=7878/tcp && sudo firewall-cmd --reload   # Fedora, RHEL (firewalld)
 ```
+
+`install-debian.sh` does this itself: ufw when that firewall is active, otherwise iptables and ip6tables.
+The iptables rules are saved with `netfilter-persistent` when it is installed, otherwise with `iptables-save` and restored on boot.
 
 Address to give: `ip -4 addr` (for example `192.168.1.20`), so **Server Url** = `ws://192.168.1.20:7878/ws`.
 On a server reachable from the Internet, prefer an HTTPS reverse proxy: see [internet.md](internet.md).

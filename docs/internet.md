@@ -1,8 +1,10 @@
 # Access from the Internet
 
-On a local network, `ws://<ip>:7878/ws` is enough. As soon as collaborators connect from home, pick one of the
-options below. With `ws://` over the Internet, the password and all traffic travel in clear text: the server
-prints a warning at startup when a password is set without TLS.
+On a local network, `ws://<ip>:7878/ws` is enough, and a password is required: the server refuses to start without
+`COLLAB_PASSWORD` unless it listens only on loopback (`COLLAB_HOST=127.0.0.1`). As soon as collaborators connect
+from home, pick one of the options below. With `ws://` over the Internet, the password and all traffic travel in
+clear text: the server prints a warning at startup when a password is set without TLS. Prefer `COLLAB_HOST=127.0.0.1`
+plus option B.
 
 | Option | For | Server Url |
 | --- | --- | --- |
@@ -26,7 +28,7 @@ by itself.
 1. Install Caddy (`sudo apt install caddy` on Debian/Ubuntu, see their website for other systems).
 2. Make the server listen locally only, so that it can only be reached through Caddy: `COLLAB_HOST=127.0.0.1`
    (in `/etc/editor-collab.env` with systemd), or `"127.0.0.1:7878:7878"` in `docker-compose.yml`.
-3. `/etc/caddy/Caddyfile` (template: `Server/Caddyfile.example`):
+3. `/etc/caddy/Caddyfile` (template: `deploy/Caddyfile.example`):
 
    ```
    collab.example.com {
