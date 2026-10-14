@@ -1,0 +1,18 @@
+# Table of contents
+
+* [Editor Collaboration](README.md)
+* [Plugin](plugin/README.md)
+  * [Configure](plugin/configure.md)
+  * [Work together](plugin/work-together.md)
+  * [Chat](plugin/chat.md)
+  * [Comments](plugin/comments.md)
+  * [Files and locks](plugin/files-and-locks.md)
+* [Server](server/README.md)
+  * [Windows](server/windows.md)
+  * [Linux](server/linux.md)
+  * [macOS](server/macos.md)
+  * [Docker](server/docker.md)
+  * [Internet](server/internet.md)
+  * [Maintenance](server/maintenance.md)
+  * [Options](server/options.md)
+* [Protocol](protocol.md)
