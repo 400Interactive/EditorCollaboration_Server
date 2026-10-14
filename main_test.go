@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -75,9 +76,11 @@ func expect(t *testing.T, conn *websocket.Conn, messageType string) map[string]a
 	return msg
 }
 
+// hello greets as a new editor install: each call has its own client id and session.
 func hello(room, password, name string) map[string]any {
 	return map[string]any{
 		"type": "hello", "protocolVersion": protocolVersion, "room": room, "password": password,
+		"clientId": newID() + newID(), "session": newID() + newID(),
 		"state": map[string]any{"name": name, "color": "#FF0000", "map": "/Game/Maps/Lvl_Hotel", "secret": "dropped"},
 	}
 }
@@ -85,6 +88,7 @@ func hello(room, password, name string) map[string]any {
 type joined struct {
 	conn         *websocket.Conn
 	id           string
+	author       string
 	peers        []any
 	chat         []any
 	chatComplete bool
@@ -94,10 +98,17 @@ type joined struct {
 
 func join(t *testing.T, ts *httptest.Server, room, password, name string) joined {
 	t.Helper()
+	return joinWith(t, ts, hello(room, password, name))
+}
+
+func joinWith(t *testing.T, ts *httptest.Server, greeting map[string]any) joined {
+	t.Helper()
 	conn := dial(t, ts)
-	send(t, conn, hello(room, password, name))
+	send(t, conn, greeting)
 	j := joined{conn: conn}
-	j.id = expect(t, conn, "welcome")["selfId"].(string)
+	welcome := expect(t, conn, "welcome")
+	j.id = welcome["selfId"].(string)
+	j.author = welcome["authorId"].(string)
 	j.peers = expect(t, conn, "roster")["peers"].([]any)
 	history := expect(t, conn, "chatHistory")
 	j.chat = history["messages"].([]any)
@@ -179,7 +190,7 @@ func TestChatHistoryForLateJoiners(t *testing.T) {
 	alice := join(t, ts, "Hotel", "", "Alice")
 	send(t, alice.conn, map[string]any{"type": "chat", "text": "  salut  "})
 	echo := expect(t, alice.conn, "chat")["message"].(map[string]any)
-	if echo["text"] != "salut" || echo["author"] != "Alice" || echo["authorId"] != alice.id || echo["color"] != "#FF0000" {
+	if echo["text"] != "salut" || echo["author"] != "Alice" || echo["authorId"] != alice.author || echo["color"] != "#FF0000" {
 		t.Fatalf("unexpected chat echo %v", echo)
 	}
 	send(t, alice.conn, map[string]any{"type": "chat", "text": "   "})
@@ -459,5 +470,207 @@ func TestSoftLockIsKeptPerAuthor(t *testing.T) {
 	bob := join(t, ts, "Hotel", "", "Bob")
 	if len(bob.assets) != 1 || bob.assets[0].(map[string]any)["working"] != true {
 		t.Fatalf("a late joiner should see the soft lock: %v", bob.assets)
+	}
+}
+
+func TestPlayOfferIsKept(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	offer := map[string]any{"address": "192.168.1.20", "port": 17777, "map": "/Game/Maps/Lvl_Hotel", "public": false, "since": 1710000000000}
+	greeting := hello("Hotel", "", "Alice")
+	greeting["state"].(map[string]any)["play"] = offer
+	alice := joinWith(t, ts, greeting)
+
+	bob := join(t, ts, "Hotel", "", "Bob")
+	if state := bob.peers[0].(map[string]any)["state"].(map[string]any); state["play"] == nil {
+		t.Fatalf("the offer sent in hello should reach a late joiner: %v", state)
+	}
+	expect(t, alice.conn, "presence")
+
+	send(t, alice.conn, map[string]any{"type": "presence", "state": map[string]any{"play": nil}})
+	state := expect(t, bob.conn, "presence")["state"].(map[string]any)
+	if value, present := state["play"]; !present || value != nil {
+		t.Fatalf("stopping should clear the offer: %v", state)
+	}
+	send(t, alice.conn, map[string]any{"type": "presence", "state": map[string]any{"play": offer}})
+	state = expect(t, bob.conn, "presence")["state"].(map[string]any)
+	if play, ok := state["play"].(map[string]any); !ok || play["port"].(float64) != 17777 {
+		t.Fatalf("a new offer should be relayed: %v", state)
+	}
+}
+
+func TestPresenceBurstIsThrottledNotDropped(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	alice := join(t, ts, "Hotel", "", "Alice")
+	bob := join(t, ts, "Hotel", "", "Bob")
+	expect(t, alice.conn, "presence")
+
+	const updates = 100
+	for i := 0; i < updates; i++ {
+		send(t, alice.conn, map[string]any{"type": "presence", "state": map[string]any{"map": fmt.Sprintf("/Game/Maps/M%d", i)}})
+	}
+	for i := 0; i < updates; i++ {
+		state := expect(t, bob.conn, "presence")["state"].(map[string]any)
+		if want := fmt.Sprintf("/Game/Maps/M%d", i); state["map"] != want {
+			t.Fatalf("update %d: expected %s, got %v", i, want, state["map"])
+		}
+	}
+}
+
+func TestAssetRecordLeftUnderTheSameNameIsTakenOver(t *testing.T) {
+	dataDir := t.TempDir()
+	ts, srv := newTestServer(t, "", dataDir)
+	bob := join(t, ts, "Hotel", "", "Bob")
+	alice := join(t, ts, "Hotel", "", "Alice")
+	expect(t, bob.conn, "presence")
+
+	send(t, alice.conn, map[string]any{"type": "asset.modify", "package": "/Game/BP_Door", "dirty": true})
+	expect(t, alice.conn, "assetModified")
+	expect(t, bob.conn, "assetModified")
+	alice.conn.Close(websocket.StatusNormalClosure, "")
+	expect(t, bob.conn, "leave")
+
+	// Another copy of the project, or a row written by protocol 5, has another author id.
+	again := join(t, ts, "Hotel", "", "Alice")
+	expect(t, bob.conn, "presence")
+	send(t, again.conn, map[string]any{"type": "asset.modify", "package": "/Game/BP_Door", "hash": "ab12", "dirty": false})
+	record := expect(t, bob.conn, "assetModified")["record"].(map[string]any)
+	if record["dirty"] != false || record["authorId"] != again.author {
+		t.Fatalf("the new author should own the record left under the same name: %v", record)
+	}
+	expect(t, again.conn, "assetModified")
+
+	srv.db.flush()
+	ts2, _ := newTestServer(t, "", dataDir)
+	carol := join(t, ts2, "Hotel", "", "Carol")
+	if len(carol.assets) != 1 || carol.assets[0].(map[string]any)["hash"] != "ab12" || carol.assets[0].(map[string]any)["dirty"] != false {
+		t.Fatalf("the database should hold the new state: %v", carol.assets)
+	}
+
+	send(t, again.conn, map[string]any{"type": "asset.clear", "package": "/Game/BP_Door"})
+	if cleared := expect(t, bob.conn, "assetCleared"); cleared["author"] != "Alice" {
+		t.Fatalf("clearing should reach the others: %v", cleared)
+	}
+	srv.db.flush()
+	ts3, _ := newTestServer(t, "", dataDir)
+	if dave := join(t, ts3, "Hotel", "", "Dave"); len(dave.assets) != 0 {
+		t.Fatalf("a cleared record must not come back from the database: %v", dave.assets)
+	}
+}
+
+func TestRenameUpdatesAssetRecords(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	alice := join(t, ts, "Hotel", "", "Alice")
+	bob := join(t, ts, "Hotel", "", "Bob")
+	expect(t, alice.conn, "presence")
+	send(t, alice.conn, map[string]any{"type": "asset.modify", "package": "/Game/BP_Door", "dirty": true})
+	expect(t, alice.conn, "assetModified")
+	expect(t, bob.conn, "assetModified")
+
+	send(t, alice.conn, map[string]any{"type": "presence", "state": map[string]any{"name": "Alicia"}})
+	expect(t, bob.conn, "presence")
+	if cleared := expect(t, bob.conn, "assetCleared"); cleared["author"] != "Alice" || cleared["package"] != "/Game/BP_Door" {
+		t.Fatalf("the record under the old name should be cleared: %v", cleared)
+	}
+	if record := expect(t, bob.conn, "assetModified")["record"].(map[string]any); record["author"] != "Alicia" || record["dirty"] != true {
+		t.Fatalf("the record should carry the new name: %v", record)
+	}
+}
+
+func TestReconnectReplacesTheStaleConnection(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	bob := join(t, ts, "Hotel", "", "Bob")
+	greeting := hello("Hotel", "", "Alice")
+	alice := joinWith(t, ts, greeting)
+	expect(t, bob.conn, "presence")
+	send(t, alice.conn, map[string]any{"type": "asset.modify", "package": "/Game/BP_Door", "dirty": true, "working": true})
+	expect(t, alice.conn, "assetModified")
+	expect(t, bob.conn, "assetModified")
+
+	// The first socket is still open on the server side, as after a network drop it has not noticed yet.
+	again := joinWith(t, ts, greeting)
+	if again.author != alice.author {
+		t.Fatalf("a reconnection should keep the author id: %s, then %s", alice.author, again.author)
+	}
+	if len(again.peers) != 1 || again.peers[0].(map[string]any)["id"] != bob.id || again.peers[0].(map[string]any)["authorId"] != bob.author {
+		t.Fatalf("the stale connection should not be in the roster: %v", again.peers)
+	}
+	if left := expect(t, bob.conn, "leave"); left["id"] != alice.id {
+		t.Fatalf("the others should drop the stale connection: %v", left)
+	}
+	if joinedMsg := expect(t, bob.conn, "presence"); joinedMsg["id"] != again.id || joinedMsg["authorId"] != alice.author {
+		t.Fatalf("then see the new one, with its author id: %v", joinedMsg)
+	}
+	if len(again.assets) != 1 || again.assets[0].(map[string]any)["authorId"] != alice.author || again.assets[0].(map[string]any)["working"] != true {
+		t.Fatalf("records should stay with their author: %v", again.assets)
+	}
+
+	// A second editor opened on the same project copy has the same client id but its own session.
+	second := hello("Hotel", "", "Alice")
+	second["clientId"] = greeting["clientId"]
+	other := joinWith(t, ts, second)
+	if len(other.peers) != 2 {
+		t.Fatalf("another session must not replace a connection: %v", other.peers)
+	}
+	expect(t, bob.conn, "presence")
+	other.conn.Close(websocket.StatusNormalClosure, "")
+	expect(t, bob.conn, "leave")
+	send(t, bob.conn, map[string]any{"type": "chat", "text": "still working"})
+	if chat := expect(t, bob.conn, "chat"); chat["message"].(map[string]any)["text"] != "still working" {
+		t.Fatalf("the soft lock must stay while an editor with that author id is connected: %v", chat)
+	}
+}
+
+func TestRestartKeepsTheAuthor(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	bob := join(t, ts, "Hotel", "", "Bob")
+	greeting := hello("Hotel", "", "Alice")
+	alice := joinWith(t, ts, greeting)
+	expect(t, bob.conn, "presence")
+
+	send(t, alice.conn, map[string]any{"type": "comment.create", "anchor": map[string]any{"kind": "asset", "package": "/Game/BP_Door"}, "text": "Mine"})
+	created := expect(t, bob.conn, "comment")["comment"].(map[string]any)
+	expect(t, alice.conn, "comment")
+	openingID := created["messages"].([]any)[0].(map[string]any)["id"].(string)
+	send(t, alice.conn, map[string]any{"type": "asset.modify", "package": "/Game/BP_Door", "dirty": true})
+	expect(t, alice.conn, "assetModified")
+	expect(t, bob.conn, "assetModified")
+	alice.conn.Close(websocket.StatusNormalClosure, "")
+	expect(t, bob.conn, "leave")
+
+	// The next launch keeps the client id and gets a new session.
+	greeting["session"] = newID() + newID()
+	again := joinWith(t, ts, greeting)
+	if again.author != alice.author {
+		t.Fatalf("a restart should keep the author id: %s, then %s", alice.author, again.author)
+	}
+	expect(t, bob.conn, "presence")
+	send(t, again.conn, map[string]any{"type": "comment.edit", "id": created["id"], "messageId": openingID, "text": "Still mine"})
+	if edited := expect(t, bob.conn, "comment")["comment"].(map[string]any); edited["messages"].([]any)[0].(map[string]any)["text"] != "Still mine" {
+		t.Fatalf("the author should edit their comment after a restart: %v", edited)
+	}
+	expect(t, again.conn, "comment")
+	send(t, again.conn, map[string]any{"type": "asset.clear", "package": "/Game/BP_Door"})
+	if cleared := expect(t, bob.conn, "assetCleared"); cleared["author"] != "Alice" {
+		t.Fatalf("the author should clear their record after a restart: %v", cleared)
+	}
+
+	// The author id is public: sending it as a client id gives another author.
+	claim := hello("Hotel", "", "Alice")
+	claim["clientId"] = alice.author
+	if mallory := joinWith(t, ts, claim); mallory.author == alice.author {
+		t.Fatal("an author id must not be claimable")
+	}
+}
+
+func TestHelloNeedsAClientID(t *testing.T) {
+	ts, _ := newTestServer(t, "", t.TempDir())
+	for _, field := range []string{"clientId", "session"} {
+		conn := dial(t, ts)
+		greeting := hello("Hotel", "", "Alice")
+		delete(greeting, field)
+		send(t, conn, greeting)
+		if msg := expect(t, conn, "error"); msg["code"] != "protocol" {
+			t.Fatalf("a hello without %s should be refused: %v", field, msg)
+		}
 	}
 }

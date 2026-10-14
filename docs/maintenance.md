@@ -6,7 +6,7 @@ Everything is in the `-data` directory:
 
 | File | Content |
 | --- | --- |
-| `collab.db` (+ `collab.db-wal`, `collab.db-shm` while running) | Full chat history, comments, modified files |
+| `collab.db` (+ `collab.db-wal`, `collab.db-shm` while running) | The last 10,000 chat messages of each room, up to 2,000 comment threads, modified files (30 days) |
 | `server.log` (+ `server.log.1`) | Logs, with `-detach` or `-log` (rotated at 10 MB) |
 | `server.json` | PID and token used by `-stop`, deleted on shutdown |
 
@@ -28,6 +28,10 @@ To restore: with the server stopped, replace `collab.db` with the copy and delet
 
 The plugin and the server exchange a protocol number. If they do not match, the plugin shows "The plugin and
 server versions are incompatible: update one of them."
+
+Plugin 1.3 and server 1.3 use protocol 6 and do not connect to a 1.2 version of the other: update the server and
+every editor at the same time. `collab.db` is kept. Modified-file marks from 1.2 are taken over by their author on
+the next save or Git change. Comment messages written with 1.2 can no longer be edited.
 
 On startup, and then once a day, the server asks GitHub whether [a newer release](https://github.com/400Interactive/EditorCollaboration_Server/releases) exists. It only writes a log line (and, on Windows, a notification). Nothing is downloaded until you ask:
 
@@ -51,11 +55,12 @@ first start, then renamed to `.imported`.
 | --- | --- | --- |
 | The Collaborators panel stays on "Connecting to ..." | Address, port or firewall | Open `http://<server>:7878/health` from the collaborator's PC; check the **Server Url** and the firewall |
 | "Wrong password." | Different password | The **Password** in Editor Preferences must be exactly `COLLAB_PASSWORD` |
-| "The plugin and server versions are incompatible" | Plugin and server at different versions | See [Updating](#updating) |
+| "The plugin and server versions are incompatible" | Plugin and server at different versions (for example a 1.2 editor and a 1.3 server) | Update both; see [Updating](#updating) |
 | "The room is full." | `-max-room-clients` reached | Raise the limit (default 64) |
 | At startup: `bind: Only one usage of each socket address` or `address already in use` | Another program (or another server) uses the port | Stop the other server (`-stop`), or change the port (`-addr :7879`) |
 | `-detach`: "A server is already running" | A server already answers on that port | `-stop` with the same `-data`, or use the existing server |
 | `-stop`: "No server is running with the data directory" | `-data` differs from the running server's | Pass exactly the same `-data` path (absolute) |
 | Messages or comments have "disappeared" | Server started with another `-data` directory (a relative `data` depends on the current directory) | Look for `collab.db` files on the machine and restart with the right `-data` |
+| Two copies of the project show the same person's marks | `Saved/EditorCollaboration/ClientId.txt` was copied with the project | Delete that file on one copy; the plugin creates a new one on the next connection |
 | "The server cannot read its database." | Disk full, permissions, damaged file | Check the logs; restore a backup of `collab.db` if needed |
 | Windows: no icon in the taskbar | Started without a session (`SYSTEM` task) or with `-no-tray` | Expected; see [windows.md](windows.md#4-automatic-start) to start it at sign-in instead |

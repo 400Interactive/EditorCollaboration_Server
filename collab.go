@@ -45,7 +45,7 @@ func stateString(state map[string]json.RawMessage, key string) string {
 func (c *client) newMessage(text string) chatMessage {
 	return chatMessage{
 		ID:       newID(),
-		AuthorID: c.id,
+		AuthorID: c.author,
 		Author:   c.name,
 		Color:    stateString(c.state, "color"),
 		Text:     text,
@@ -53,8 +53,8 @@ func (c *client) newMessage(text string) chatMessage {
 	}
 }
 
-// delivery is a broadcast prepared under server.mu and sent after the lock is released.
-// The JSON is built while the lock is held so a later edit cannot change the bytes.
+// delivery is a broadcast prepared and queued under server.mu, so every client receives the changes in the order
+// they were applied. Queuing never blocks: a client whose queue is full is disconnected.
 type delivery struct {
 	recipients []*client
 	message    []byte
@@ -85,7 +85,7 @@ func deliver(batch []delivery) {
 // still matches the display name it was stored with.
 func authoredBy(message chatMessage, c *client) bool {
 	if message.AuthorID != "" {
-		return message.AuthorID == c.id
+		return message.AuthorID == c.author
 	}
 	return message.Author == c.name
 }
@@ -100,9 +100,9 @@ func (s *server) handleCollab(c *client, msg inbound) {
 	if c.room != nil && c.room.data != nil {
 		writes = c.room.data.takePending()
 	}
+	deliver(batch)
 	s.mu.Unlock()
 	s.persist(writes)
-	deliver(batch)
 }
 
 func (s *server) applyCollab(c *client, msg inbound, batch *[]delivery) {
@@ -178,14 +178,21 @@ func (s *server) applyCollab(c *client, msg inbound, batch *[]delivery) {
 		}
 		queueBroadcast(c.room, "", map[string]any{
 			"type": "ping", "id": newID(), "anchor": json.RawMessage(msg.Anchor),
-			"authorId": c.id, "author": c.name, "color": stateString(c.state, "color"),
+			"authorId": c.author, "author": c.name, "color": stateString(c.state, "color"),
 			"at": time.Now().UnixMilli(), "seconds": seconds,
 		}, batch)
 
 	case "asset.modify":
 		record, ok := c.newAssetRecord(msg)
-		if !ok || !data.upsertAsset(record) {
+		if !ok {
 			return
+		}
+		previousName, ok := data.upsertAsset(record, c.room.online)
+		if !ok {
+			return
+		}
+		if previousName != "" {
+			queueBroadcast(c.room, "", map[string]any{"type": "assetCleared", "package": record.Package, "author": previousName}, batch)
 		}
 		queueBroadcast(c.room, "", map[string]any{"type": "assetModified", "record": record}, batch)
 
@@ -193,7 +200,7 @@ func (s *server) applyCollab(c *client, msg inbound, batch *[]delivery) {
 		if !validPackageName(msg.Package) {
 			return
 		}
-		record, ok := data.removeAsset(msg.Package, c.id)
+		record, ok := data.removeAsset(msg.Package, c.author, c.name, c.room.online)
 		if !ok {
 			return
 		}
@@ -262,7 +269,7 @@ func (c *client) newAssetRecord(msg inbound) (assetRecord, bool) {
 		Hash:     strings.ToLower(msg.Hash),
 		Dirty:    msg.Dirty,
 		Working:  msg.Working,
-		AuthorID: c.id,
+		AuthorID: c.author,
 		Author:   c.name,
 		Color:    stateString(c.state, "color"),
 		At:       time.Now().UnixMilli(),

@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	version         = "1.2.0"
-	protocolVersion = 5
+	version         = "1.3.0"
+	protocolVersion = 6
 
 	maxMessageBytes = 64 << 10
 	maxRoomLength   = 128
@@ -46,7 +46,6 @@ const (
 
 	messagesPerSecond = 30.0
 	messageBurst      = 60.0
-	maxDroppedInARow  = 300
 
 	// A presence value larger than this is dropped. The whole frame is already limited by maxMessageBytes.
 	maxPresenceFieldBytes = 8 << 10
@@ -58,7 +57,7 @@ const (
 var allowedFields = map[string]bool{
 	"name": true, "color": true, "map": true, "cam": true,
 	"asset": true, "graph": true, "nodes": true, "actors": true, "active": true,
-	"pie": true, "sequencer": true, "branch": true, "actorsMore": true, "nodesMore": true,
+	"pie": true, "play": true, "sequencer": true, "branch": true, "actorsMore": true, "nodesMore": true,
 }
 
 type config struct {
@@ -118,10 +117,25 @@ type room struct {
 	data    *roomData
 }
 
+// online tells whether an editor with this author id is in the room. Requires server.mu.
+func (rm *room) online(authorID string) bool {
+	for _, other := range rm.clients {
+		if other.author == authorID {
+			return true
+		}
+	}
+	return false
+}
+
 type client struct {
-	id    string
-	name  string
-	room  *room
+	id   string
+	name string
+	// author stamps chat, comments and modified-file records. It is derived from the secret client id the editor
+	// keeps across launches, so a reconnection or a restart keeps it, and the others cannot reuse it.
+	author string
+	// session is secret and changes at each editor launch.
+	session string
+	room    *room
 	conn  *websocket.Conn
 	send  chan []byte
 	state map[string]json.RawMessage
@@ -148,11 +162,14 @@ type inbound struct {
 	Working         bool                       `json:"working"`
 	Seconds         int                        `json:"seconds"`
 	Before          string                     `json:"before"`
+	ClientID        string                     `json:"clientId"`
+	Session         string                     `json:"session"`
 }
 
 type peerEntry struct {
-	ID    string                     `json:"id"`
-	State map[string]json.RawMessage `json:"state"`
+	ID       string                     `json:"id"`
+	AuthorID string                     `json:"authorId"`
+	State    map[string]json.RawMessage `json:"state"`
 }
 
 func main() {
@@ -530,14 +547,19 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 	if roomName == "" || utf8.RuneCountInString(roomName) > maxRoomLength {
 		return nil, reject(conn, "room", "Invalid room name.")
 	}
+	if !validClientKey(hello.ClientID) || !validClientKey(hello.Session) {
+		return nil, reject(conn, "protocol", "The hello message needs a clientId and a session.")
+	}
 
 	state := filterState(hello.State)
 	c := &client{
-		id:    newID(),
-		conn:  conn,
-		send:  make(chan []byte, sendQueueSize),
-		state: map[string]json.RawMessage{},
-		done:  make(chan struct{}),
+		id:      newID(),
+		author:  authorID(hello.ClientID),
+		session: hello.Session,
+		conn:    conn,
+		send:    make(chan []byte, sendQueueSize),
+		state:   map[string]json.RawMessage{},
+		done:    make(chan struct{}),
 	}
 	for key, value := range state {
 		if !isNull(value) {
@@ -567,37 +589,66 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 		}
 	}
 	saved := rm.data
-	if len(rm.clients) >= s.cfg.maxRoomClients {
+	var stale *client
+	for _, other := range rm.clients {
+		if other.author == c.author && other.session == c.session {
+			stale = other
+			break
+		}
+	}
+	others := len(rm.clients)
+	if stale != nil {
+		others--
+	}
+	if others >= s.cfg.maxRoomClients {
 		if len(rm.clients) == 0 {
 			delete(s.rooms, roomName)
 		}
 		s.mu.Unlock()
 		return nil, reject(conn, "full", "The room is full.")
 	}
+	var joined []delivery
+	staleName, staleID := "", ""
+	if stale != nil {
+		staleName, staleID = stale.name, stale.id
+		s.replaceStale(rm, stale, &joined)
+	}
 	peers := make([]peerEntry, 0, len(rm.clients))
 	for _, other := range rm.clients {
-		peers = append(peers, peerEntry{ID: other.id, State: copyState(other.state)})
+		peers = append(peers, peerEntry{ID: other.id, AuthorID: other.author, State: copyState(other.state)})
 	}
 	// Queued while holding the lock so that no presence update can reach this client before its roster.
-	c.enqueue(mustJSON(map[string]any{"type": "welcome", "selfId": c.id, "protocolVersion": protocolVersion}))
+	c.enqueue(mustJSON(map[string]any{"type": "welcome", "selfId": c.id, "authorId": c.author, "protocolVersion": protocolVersion}))
 	c.enqueue(mustJSON(map[string]any{"type": "roster", "peers": peers}))
 	c.enqueue(mustJSON(map[string]any{"type": "chatHistory", "messages": saved.Chat, "complete": saved.ChatComplete}))
 	c.enqueue(mustJSON(map[string]any{"type": "comments", "comments": saved.Comments}))
 	c.enqueue(mustJSON(map[string]any{"type": "assets", "records": saved.Assets}))
 	c.room = rm
 	rm.clients[c.id] = c
-	var joined []delivery
-	queueBroadcast(rm, c.id, map[string]any{"type": "presence", "id": c.id, "state": c.state}, &joined)
-	s.mu.Unlock()
+	queueBroadcast(rm, c.id, map[string]any{"type": "presence", "id": c.id, "authorId": c.author, "state": c.state}, &joined)
 	deliver(joined)
+	writes := saved.takePending()
+	s.mu.Unlock()
+	s.persist(writes)
+	if staleID != "" {
+		log.Print(T("server.left", roomName, staleName, staleID))
+	}
 
 	return c, nil
+}
+
+// replaceStale drops a connection the same editor session left behind (its socket is not closed yet) in favor of
+// the new one. Its records stay, since both have the same author id. Requires s.mu.
+func (s *server) replaceStale(rm *room, stale *client, batch *[]delivery) {
+	delete(rm.clients, stale.id)
+	stale.room = nil
+	queueBroadcast(rm, stale.id, map[string]any{"type": "leave", "id": stale.id}, batch)
+	stale.shutdown(websocket.StatusGoingAway, "replaced by a new connection")
 }
 
 func (c *client) readLoop(ctx context.Context, s *server) {
 	tokens := messageBurst
 	last := time.Now()
-	dropped := 0
 
 	for {
 		_, data, err := c.conn.Read(ctx)
@@ -605,19 +656,22 @@ func (c *client) readLoop(ctx context.Context, s *server) {
 			return
 		}
 
+		// Past the limit, reading pauses instead of dropping: clients send only changes, so a lost one stays wrong.
 		now := time.Now()
 		tokens = min(messageBurst, tokens+now.Sub(last).Seconds()*messagesPerSecond)
 		last = now
 		if tokens < 1 {
-			dropped++
-			if dropped > maxDroppedInARow {
-				c.conn.Close(websocket.StatusPolicyViolation, "too many messages")
+			select {
+			case <-time.After(time.Duration((1 - tokens) / messagesPerSecond * float64(time.Second))):
+			case <-c.done:
+				return
+			case <-ctx.Done():
 				return
 			}
-			continue
+			tokens = 1
+			last = time.Now()
 		}
 		tokens--
-		dropped = 0
 
 		var msg inbound
 		if json.Unmarshal(data, &msg) != nil {
@@ -662,7 +716,8 @@ func (s *server) updatePresence(c *client, delta map[string]json.RawMessage) {
 
 	s.mu.Lock()
 	var batch []delivery
-	if c.room != nil {
+	var writes []func(*sql.Tx) error
+	if rm := c.room; rm != nil {
 		for key, value := range delta {
 			if isNull(value) {
 				delete(c.state, key)
@@ -670,13 +725,24 @@ func (s *server) updatePresence(c *client, delta map[string]json.RawMessage) {
 				c.state[key] = value
 			}
 		}
+		renamed := false
 		if _, ok := delta["name"]; ok {
+			previous := c.name
 			c.name = displayName(c.state)
+			renamed = c.name != previous
 		}
-		queueBroadcast(c.room, c.id, map[string]any{"type": "presence", "id": c.id, "state": delta}, &batch)
+		queueBroadcast(rm, c.id, map[string]any{"type": "presence", "id": c.id, "state": delta}, &batch)
+		if renamed && rm.data != nil {
+			for _, change := range rm.data.renameAuthor(c.author, c.name, rm.online) {
+				queueBroadcast(rm, "", map[string]any{"type": "assetCleared", "package": change.record.Package, "author": change.previousName}, &batch)
+				queueBroadcast(rm, "", map[string]any{"type": "assetModified", "record": change.record}, &batch)
+			}
+			writes = rm.data.takePending()
+		}
 	}
-	s.mu.Unlock()
 	deliver(batch)
+	s.mu.Unlock()
+	s.persist(writes)
 }
 
 func (s *server) leave(c *client) {
@@ -685,13 +751,14 @@ func (s *server) leave(c *client) {
 	var writes []func(*sql.Tx) error
 	rm := c.room
 	if rm != nil {
-		if rm.data != nil {
-			for _, record := range rm.data.clearWorking(c.id) {
+		delete(rm.clients, c.id)
+		// Another editor launched from the same project copy has the same author id and keeps the marks.
+		if rm.data != nil && !rm.online(c.author) {
+			for _, record := range rm.data.clearWorking(c.author) {
 				queueBroadcast(rm, c.id, map[string]any{"type": "assetModified", "record": record}, &batch)
 			}
 			writes = rm.data.takePending()
 		}
-		delete(rm.clients, c.id)
 		if len(rm.clients) == 0 {
 			delete(s.rooms, rm.name)
 		} else {
@@ -699,9 +766,9 @@ func (s *server) leave(c *client) {
 		}
 		c.room = nil
 	}
+	deliver(batch)
 	s.mu.Unlock()
 	s.persist(writes)
-	deliver(batch)
 
 	c.shutdown(websocket.StatusNormalClosure, "")
 	if rm != nil {
@@ -843,6 +910,24 @@ func newID() string {
 		panic(err)
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// authorID is the public id of a secret client id: everyone in the room sees it, nobody can send it back.
+func authorID(clientID string) string {
+	sum := sha256.Sum256([]byte("author:" + clientID))
+	return hex.EncodeToString(sum[:16])
+}
+
+func validClientKey(key string) bool {
+	if len(key) < 16 || len(key) > 64 {
+		return false
+	}
+	for _, r := range key {
+		if !(r == '-' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 func remoteHost(r *http.Request) string {

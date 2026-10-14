@@ -465,70 +465,113 @@ func (d *roomData) clearWorking(authorID string) []assetRecord {
 	return updated
 }
 
-// upsertAsset keeps one record per package and author id. A display name already used by someone else is refused,
-// so renaming onto another collaborator's row cannot steal it. Requires server.mu.
-func (d *roomData) upsertAsset(record assetRecord) bool {
-	for index := range d.Assets {
-		if d.Assets[index].Package == record.Package && d.Assets[index].AuthorID != record.AuthorID && d.Assets[index].Author == record.Author {
-			return false
+// upsertAsset keeps one record per package and author id, and one per package and display name. A name used by
+// another connected collaborator is refused, so renaming cannot steal their row. A record left under that name by
+// an author who is gone (a protocol 5 row carries a connection id) is taken over. previousName is set when the
+// caller's own record changes name. Requires server.mu.
+func (d *roomData) upsertAsset(record assetRecord, online func(authorID string) bool) (previousName string, ok bool) {
+	own, left := -1, -1
+	for index, existing := range d.Assets {
+		if existing.Package != record.Package {
+			continue
+		}
+		if existing.AuthorID == record.AuthorID {
+			own = index
+		} else if existing.Author == record.Author {
+			if online(existing.AuthorID) {
+				return "", false
+			}
+			left = index
 		}
 	}
-	replaced := false
-	for index := range d.Assets {
-		if d.Assets[index].Package == record.Package && d.Assets[index].AuthorID == record.AuthorID {
-			d.Assets[index] = record
-			replaced = true
-			break
+	switch {
+	case own >= 0:
+		if d.Assets[own].Author != record.Author {
+			previousName = d.Assets[own].Author
 		}
-	}
-	if !replaced {
+		d.Assets[own] = record
+		if left >= 0 {
+			d.Assets = append(d.Assets[:left], d.Assets[left+1:]...)
+		}
+	case left >= 0:
+		d.Assets[left] = record
+	default:
 		if len(d.Assets) >= maxAssetsPerRoom {
-			return false
+			return "", false
 		}
 		d.Assets = append(d.Assets, record)
 	}
 	room := d.name
 	d.deferWrite(func(tx *sql.Tx) error { return upsertAsset(tx, room, record) })
-	return true
+	return previousName, true
 }
 
+// upsertAsset writes what roomData.upsertAsset keeps: the row replaces those of the same package with the same
+// author id or the same display name. Rows imported without an author id only match by name.
 func upsertAsset(tx *sql.Tx, room string, r assetRecord) error {
-	result, err := tx.Exec(`UPDATE assets SET author = ?, asset = ?, hash = ?, dirty = ?, working = ?, color = ?, at = ?
-		WHERE room = ? AND package = ? AND author_id = ?`,
-		r.Author, r.Asset, r.Hash, r.Dirty, r.Working, r.Color, r.At, room, r.Package, r.AuthorID)
-	if err != nil {
+	if err := deleteAssetRows(tx, room, r.Package, r.Author, r.AuthorID); err != nil {
 		return err
 	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if updated > 0 {
-		return nil
-	}
-	_, err = tx.Exec(`INSERT INTO assets (room, package, author, asset, hash, dirty, working, author_id, color, at)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-		WHERE NOT EXISTS (SELECT 1 FROM assets WHERE room = ? AND package = ? AND author = ?)`,
-		room, r.Package, r.Author, r.Asset, r.Hash, r.Dirty, r.Working, r.AuthorID, r.Color, r.At,
-		room, r.Package, r.Author)
+	_, err := tx.Exec(`INSERT INTO assets (room, package, author, asset, hash, dirty, working, author_id, color, at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		room, r.Package, r.Author, r.Asset, r.Hash, r.Dirty, r.Working, r.AuthorID, r.Color, r.At)
 	return err
 }
 
-// removeAsset drops the caller's own record. Requires server.mu.
-func (d *roomData) removeAsset(pkg, authorID string) (assetRecord, bool) {
-	for index := range d.Assets {
-		if d.Assets[index].Package == pkg && d.Assets[index].AuthorID == authorID {
-			record := d.Assets[index]
-			d.Assets = append(d.Assets[:index], d.Assets[index+1:]...)
-			room := d.name
-			d.deferWrite(func(tx *sql.Tx) error {
-				_, err := tx.Exec(`DELETE FROM assets WHERE room = ? AND package = ? AND author_id = ?`, room, pkg, authorID)
-				return err
-			})
-			return record, true
+func deleteAssetRows(tx *sql.Tx, room, pkg, author, authorID string) error {
+	_, err := tx.Exec(`DELETE FROM assets WHERE room = ? AND package = ? AND (author = ? OR (author_id = ? AND author_id <> ''))`,
+		room, pkg, author, authorID)
+	return err
+}
+
+// removeAsset drops the caller's own record, or the one left under the caller's name by an author who is gone.
+// Requires server.mu.
+func (d *roomData) removeAsset(pkg, authorID, name string, online func(authorID string) bool) (assetRecord, bool) {
+	found := -1
+	for index, existing := range d.Assets {
+		if existing.Package != pkg {
+			continue
+		}
+		if existing.AuthorID == authorID {
+			found = index
+			break
+		}
+		if existing.Author == name && !online(existing.AuthorID) {
+			found = index
 		}
 	}
-	return assetRecord{}, false
+	if found < 0 {
+		return assetRecord{}, false
+	}
+	record := d.Assets[found]
+	d.Assets = append(d.Assets[:found], d.Assets[found+1:]...)
+	room := d.name
+	d.deferWrite(func(tx *sql.Tx) error { return deleteAssetRows(tx, room, pkg, record.Author, record.AuthorID) })
+	return record, true
+}
+
+type assetRename struct {
+	record       assetRecord
+	previousName string
+}
+
+// renameAuthor puts a connection's new display name on its records, with the rules of upsertAsset: a package where
+// a connected collaborator already uses that name keeps the old one. Requires server.mu.
+func (d *roomData) renameAuthor(authorID, name string, online func(authorID string) bool) []assetRename {
+	var stale []assetRecord
+	for _, existing := range d.Assets {
+		if existing.AuthorID == authorID && existing.Author != name {
+			stale = append(stale, existing)
+		}
+	}
+	var changes []assetRename
+	for _, record := range stale {
+		record.Author = name
+		if previous, ok := d.upsertAsset(record, online); ok {
+			changes = append(changes, assetRename{record: record, previousName: previous})
+		}
+	}
+	return changes
 }
 
 // importLegacyRooms moves the room-*.json files of server versions before 1.2 into the database, once.

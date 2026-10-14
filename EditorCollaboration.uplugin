@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.2",
+	"Version": 2,
+	"VersionName": "1.3",
 	"FriendlyName": "Editor Collaboration",
 	"Description": "Real-time collaboration in the editor: see where your teammates are (map, viewport, Blueprint, Material...), join them in one click, chat, pin comments and see which assets they changed. Editor only.",
 	"Category": "Editor",
