@@ -1,47 +1,50 @@
-# Serveur Editor Collaboration en Rust
+# Editor Collaboration Rust Server
 
-Le serveur implémente le protocole 9 du plugin Unreal. Il fournit la présence, le chat, les commentaires, les pings, les marques de travail, la publication et la suppression de packages, la synchronisation des graphes et niveaux, le journal de reprise et le transfert de fichiers. Les données utilisent le schéma SQLite et l’arborescence `blobs` du serveur Go.
+The server implements protocol 9 of the Unreal Engine plugin. It supports presence, chat, comments, pings, work markers, package publishing and deletion, graph and level synchronization, a replay journal, and file transfers. It uses the same SQLite schema and blobs directory layout as the Go server.
 
-## Démarrer sous Windows
+[Editor Collaboration documentation](https://docs.400interactive.com/editor-collaboration/)
 
-Depuis `Server_Rust`, avec Rust stable et les outils C++ de Visual Studio disponibles.
+## Getting started on Windows
+
+Install stable Rust and the Visual Studio C++ build tools, then run the following from the root of this repository:
 
 ```powershell
-./build.ps1
-./dist/collab-server-rust-windows-amd64.exe -addr 127.0.0.1:7878 -data ./data
+cargo build --locked --release
+./target/release/collab-server.exe -addr 127.0.0.1:7878 -data ./data
 ```
 
-Dans le plugin, saisir `ws://127.0.0.1:7878/ws` et le nom du salon. Pour un essai avec un serveur Go déjà à l’écoute sur 7878, choisir un autre port et un dossier de données distinct.
+In the plugin, enter the room name and connect to `ws://127.0.0.1:7878/ws`. If the Go server is already listening on port 7878, use a different port and a separate data directory for this test.
 
-Les options `-detach`, `-stop` et `-healthcheck` acceptent le même `-data` que le serveur. Sous Windows, `-no-tray` masque l’icône de notification. `-log` écrit aussi dans un fichier.
+The `-detach`, `-stop`, and `-healthcheck` options accept the same `-data` path as the server. On Windows, `-no-tray` hides the notification area icon. Use `-log` to also write output to a log file.
 
-## Héberger le serveur
+## Hosting the server
 
-- Pour un salon protégé, définir `COLLAB_ROOM` et `COLLAB_PASSWORD`. Pour plusieurs salons, définir `COLLAB_ROOM_PASSWORDS_FILE` sur un fichier JSON qui associe chaque nom de salon à un mot de passe distinct.
-- `COLLAB_HOST`, `COLLAB_PORT`, `COLLAB_DATA_DIR` et `COLLAB_MAX_ROOM_CLIENTS` règlent l’écoute et le stockage. Le serveur exige un mot de passe pour écouter hors boucle locale.
-- Pour WSS direct, fournir les fichiers PEM avec `-tls-cert` et `-tls-key`. L’exemple Caddy dans `deploy` montre comment terminer TLS sur un proxy.
-- Sous Linux ou macOS, utiliser `sh build.sh`. Les scripts de compilation acceptent aussi une cible Rust installée et son compilateur C. Ils écrivent les binaires et les sommes SHA-256 dans `dist`.
-- Pour Docker, renseigner `COLLAB_ROOM` et `COLLAB_PASSWORD`, puis lancer `docker compose up -d --build` depuis ce dossier. Le port hôte peut être réglé avec `COLLAB_PUBLISHED_PORT`.
-- Sous Debian avec systemd, exécuter `sudo sh deploy/install-debian.sh <binaire-linux>`. Le service et son dossier de données ont des noms distincts de ceux du serveur Go. Modifier `/etc/editor-collab-rust.env` pour autoriser les clients distants, puis redémarrer le service.
+- For a password-protected room, set `COLLAB_ROOM` and `COLLAB_PASSWORD`. For multiple rooms, set `COLLAB_ROOM_PASSWORDS_FILE` to the path of a JSON file that maps each room name to its own password.
+- Use `COLLAB_HOST`, `COLLAB_PORT`, `COLLAB_DATA_DIR`, and `COLLAB_MAX_ROOM_CLIENTS` to configure the bind address, port, data directory, and per-room client limit. The server requires a password to listen outside the loopback interface.
+- To serve WSS directly, supply PEM files with `-tls-cert` and `-tls-key`. See the Caddy example in `deploy` for TLS termination at a reverse proxy.
+- On Linux or macOS, run `cargo build --locked --release` to build `target/release/collab-server`. When this repository is checked out as the Unreal plugin's `Server` directory, the `build.sh` and `build.ps1` scripts can also read the parent plugin descriptor and write named binaries and SHA-256 checksums to `dist`. To build for a different target with those scripts, install the Rust target and its C compiler.
+- For Docker, set `COLLAB_ROOM` and `COLLAB_PASSWORD`, then run `docker compose up -d --build` from this directory. Set `COLLAB_PUBLISHED_PORT` to change the host port.
+- On Debian with systemd, run `sudo sh deploy/install-debian.sh <linux-binary>`. The Rust and Go servers use different service and data directory names. To allow remote clients, edit `/etc/editor-collab-rust.env` and restart the service.
 
-Les commandes `-check-update` et `-update` recherchent les exécutables `collab-server-rust-<os>-<arch>` et leur entrée dans `SHA256SUMS` sur le dépôt de releases configuré par `COLLAB_GITHUB_REPO`. Le suffixe Windows est `.exe`. `COLLAB_AUTO_UPDATE=1` permet d’installer les mises à jour dans les installations où le processus peut écrire son exécutable. Pour systemd, l’installateur fournit la commande `--update` à exécuter avec les droits d’installation. `COLLAB_UPDATE_CHECK=0` désactive la vérification périodique.
+The `-check-update` and `-update` commands look for the `collab-server-rust-<os>-<arch>` executable and its entry in `SHA256SUMS` in the GitHub releases repository configured by `COLLAB_GITHUB_REPO`. Windows binaries use the `.exe` extension. Set `COLLAB_AUTO_UPDATE=1` to enable automatic updates when the server process can write to its executable. For systemd installations, run `sudo sh deploy/install-debian.sh --update`. Set `COLLAB_UPDATE_CHECK=0` to disable periodic checks.
 
-## Réutiliser les données Go
+## Migrating data from Go
 
-Arrêter Go, sauvegarder son dossier de données complet, puis passer la copie avec `-data`. Rust ouvre la base SQLite, ajoute les colonnes manquantes et importe les anciens fichiers `room-*.json`. Conserver ensemble `collab.db` et le dossier `blobs`.
+Stop the Go server, back up its entire data directory, then pass the copy to the Rust server with `-data`. The Rust server opens the SQLite database, adds missing columns, and imports legacy `room-*.json` files. Keep `collab.db` and the `blobs` directory together.
 
-## Vérifier le protocole
+## Testing the protocol
+
+After building the Windows executable, run:
 
 ```powershell
 python -m pip install websockets==17.4
-python tests/protocol.py dist/collab-server-rust-windows-amd64.exe
-python tests/protocol.py dist/collab-server-rust-windows-amd64.exe <serveur-Go>
+python tests/protocol.py target/release/collab-server.exe
 ```
 
-Le second argument fait créer et remplir le dossier de données temporaire par Go, puis relit les données et le journal avec Rust. Les deux scénarios passent par de vraies connexions HTTP et WebSocket.
+On Linux or macOS, use `target/release/collab-server` as the executable path. To check migration from Go, pass the path to a compatible Go server executable as the second argument. The test uses Go to populate a temporary data directory, then uses Rust to read the data and replay the journal. Both scenarios use live HTTP and WebSocket connections.
 
 ## GitHub Actions
 
-Le workflow compile et teste le serveur Rust à chaque pull request et push sur `main`. Les binaires sont disponibles dans les artefacts du run pour Windows x64, Linux x64 et ARM64, et macOS Intel et Apple Silicon.
+GitHub Actions builds and tests the Rust server on every pull request and push to `main`. The workflow run provides binary artifacts for Windows x64, Linux x64 and ARM64, and macOS Intel and Apple Silicon.
 
-Pour publier une release, pousser un tag qui correspond à la version de `Cargo.toml` (par exemple `1.4.0` ou `v1.4.0`). La publication ajoute les cinq binaires et le fichier `SHA256SUMS` après la réussite de tous les tests.
+To publish a release, push a tag matching the version in `Cargo.toml`, such as `1.4.0` or `v1.4.0`. After all tests pass, the workflow publishes all five binaries and the `SHA256SUMS` file.

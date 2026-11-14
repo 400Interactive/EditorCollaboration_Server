@@ -132,9 +132,9 @@ async def exercise(base):
                                     room="Other", password="other-key")
         other_token = other["blobToken"]
 
-        await alice.send("chat", text=" Bonjour ")
+        await alice.send("chat", text=" Hello ")
         chat = (await bob.expect("chat"))["message"]
-        assert chat["authorId"] == author and chat["text"] == "Bonjour"
+        assert chat["authorId"] == author and chat["text"] == "Hello"
         await alice.send("chat.history", before=chat["id"])
         history = await alice.expect("chatOlder")
         assert [message["text"] for message in history["messages"]] == ["Imported"] and history["complete"]
@@ -209,7 +209,7 @@ async def exercise(base):
 async def verify_restart(base):
     async with client(base) as alice:
         welcome = await alice.join(ALICE, uuid.uuid4().hex, "Alicia")
-        assert (await alice.expect("chatHistory"))["messages"][-1]["text"] == "Bonjour"
+        assert (await alice.expect("chatHistory"))["messages"][-1]["text"] == "Hello"
         comment = (await alice.expect("comments"))["comments"][0]
         assert comment["resolved"] and comment["messages"][0]["text"] == "Edited"
         record = (await alice.expect("assets"))["records"][0]
