@@ -1,82 +1,39 @@
-# Builds collab-server for Windows, Linux and macOS into dist/.
-# Uses a local Go toolchain when available, otherwise the golang Docker image.
-# Reads EditorCollaboration.uplugin (a symlink to the plugin descriptor).
-$ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+[CmdletBinding()]
+param([string]$Target = '', [string]$Cargo = 'cargo')
 
-$descriptorPath = Join-Path $PSScriptRoot "EditorCollaboration.uplugin"
-$shortcutPath = Join-Path $PSScriptRoot "EditorCollaboration.uplugin.lnk"
-if (-not (Test-Path -LiteralPath $descriptorPath) -and (Test-Path -LiteralPath $shortcutPath)) {
-    $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
-    if ([string]::IsNullOrWhiteSpace($shortcut.TargetPath) -or -not (Test-Path -LiteralPath $shortcut.TargetPath)) {
-        throw "EditorCollaboration.uplugin.lnk points at $($shortcut.TargetPath), which does not exist."
+$ErrorActionPreference = 'Stop'
+$descriptor = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '../EditorCollaboration.uplugin') | ConvertFrom-Json
+$env:COLLAB_PLUGIN_VERSION = [string]$descriptor.VersionName
+$env:COLLAB_PLUGIN_MARKETPLACE = [string]$descriptor.MarketplaceURL
+if (-not $Target) {
+    $Target = (& rustc -vV | Select-String '^host: ').Line.Substring(6)
+}
+if ($Target -notmatch '^(x86_64|aarch64)-(pc|unknown|apple)-(windows-msvc|linux-gnu|linux-musl|darwin)$') {
+    throw "Unsupported release target $Target"
+}
+$arch = if ($Matches[1] -eq 'x86_64') { 'amd64' } else { 'arm64' }
+$platform = switch -Wildcard ($Matches[3]) {
+    'windows-*' { 'windows' }
+    'linux-*' { 'linux' }
+    'darwin' { 'darwin' }
+}
+$extension = if ($platform -eq 'windows') { '.exe' } else { '' }
+$manifest = Join-Path $PSScriptRoot 'Cargo.toml'
+$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
+& $Cargo build --locked --release --manifest-path $manifest --target $Target --target-dir $targetDir
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$dist = Join-Path $PSScriptRoot 'dist'
+New-Item -ItemType Directory -Path $dist -Force | Out-Null
+$name = "collab-server-rust-$platform-$arch$extension"
+Copy-Item -LiteralPath (Join-Path $targetDir "$Target/release/collab-server$extension") -Destination (Join-Path $dist $name)
+$sums = Get-ChildItem -LiteralPath $dist -File -Filter 'collab-server-rust-*' |
+    Where-Object { $_.Name -notlike '*.sha256' } |
+    Sort-Object Name | ForEach-Object {
+        $digest = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $line = "$digest  $($_.Name)"
+        $line | Set-Content -Encoding ascii -LiteralPath ($_.FullName + '.sha256')
+        $line
     }
-    $descriptorPath = $shortcut.TargetPath
-}
-if (-not (Test-Path -LiteralPath $descriptorPath)) {
-    throw "EditorCollaboration.uplugin does not resolve. Build from the Unreal tree, where this file links to ../EditorCollaboration.uplugin."
-}
-$descriptorText = Get-Content -Raw -LiteralPath $descriptorPath
-$trimmed = $descriptorText.Trim()
-if (-not $trimmed.StartsWith("{")) {
-    $linked = $trimmed.Split("`n")[0].Trim()
-    if (-not [System.IO.Path]::IsPathRooted($linked)) {
-        $linked = Join-Path $PSScriptRoot $linked
-    }
-    if (-not (Test-Path -LiteralPath $linked)) {
-        throw "EditorCollaboration.uplugin points at $linked, which does not exist."
-    }
-    $descriptorText = Get-Content -Raw -LiteralPath $linked
-}
-$descriptor = $descriptorText | ConvertFrom-Json
-$pluginVersion = [string]$descriptor.VersionName
-$pluginMarket = [string]$descriptor.MarketplaceURL
-if ([string]::IsNullOrWhiteSpace($pluginVersion)) {
-    throw "VersionName is missing in EditorCollaboration.uplugin."
-}
-$ldflags = "-s -w -X main.pluginVersion=$pluginVersion -X main.pluginMarketplaceURL=$pluginMarket"
-
-$targets = @(
-    @{ OS = "windows"; Arch = "amd64"; Ext = ".exe" },
-    @{ OS = "linux";   Arch = "amd64"; Ext = "" },
-    @{ OS = "linux";   Arch = "arm64"; Ext = "" },
-    @{ OS = "darwin";  Arch = "amd64"; Ext = "" },
-    @{ OS = "darwin";  Arch = "arm64"; Ext = "" }
-)
-
-New-Item -ItemType Directory -Force -Path dist | Out-Null
-
-if (Get-Command go -ErrorAction SilentlyContinue) {
-    $env:CGO_ENABLED = "0"
-    foreach ($t in $targets) {
-        $env:GOOS = $t.OS
-        $env:GOARCH = $t.Arch
-        $out = "dist/collab-server-$($t.OS)-$($t.Arch)$($t.Ext)"
-        Write-Host "Building $out"
-        go build -trimpath -ldflags $ldflags -o $out .
-        if ($LASTEXITCODE -ne 0) { throw "go build failed for $out" }
-    }
-    Remove-Item Env:GOOS, Env:GOARCH -ErrorAction SilentlyContinue
-}
-elseif (Get-Command docker -ErrorAction SilentlyContinue) {
-    $script = ($targets | ForEach-Object {
-        "echo Building dist/collab-server-$($_.OS)-$($_.Arch)$($_.Ext) && GOOS=$($_.OS) GOARCH=$($_.Arch) go build -trimpath -ldflags='$ldflags' -o dist/collab-server-$($_.OS)-$($_.Arch)$($_.Ext) ."
-    }) -join " && "
-    docker run --rm -v "${PSScriptRoot}:/src" -w /src -e CGO_ENABLED=0 golang:1.27-alpine sh -c $script
-    if ($LASTEXITCODE -ne 0) { throw "docker build failed (is Docker Desktop running?)" }
-}
-else {
-    throw "Neither Go (https://go.dev/dl/) nor Docker is installed."
-}
-
-$pluginJson = '{"version":"' + $pluginVersion + '","marketplaceUrl":"' + $pluginMarket + '"}'
-Set-Content -Path (Join-Path $PSScriptRoot "dist/plugin.json") -Value $pluginJson -Encoding ascii -NoNewline
-Add-Content -Path (Join-Path $PSScriptRoot "dist/plugin.json") -Value "" -Encoding ascii
-
-$lines = Get-ChildItem (Join-Path $PSScriptRoot "dist") -File | Where-Object { $_.Name -ne "SHA256SUMS" } | ForEach-Object {
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower()
-    "{0}  {1}" -f $hash, $_.Name
-}
-Set-Content -Path (Join-Path $PSScriptRoot "dist/SHA256SUMS") -Value $lines -Encoding ascii
-
-Write-Host "Done. Binaries are in $PSScriptRoot\dist"
+$sums | Set-Content -Encoding ascii -LiteralPath (Join-Path $dist 'SHA256SUMS')
+Write-Output (Join-Path $dist $name)

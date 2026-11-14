@@ -1,3 +1,4 @@
-dist/
-data/
-*.lnk
+/target/
+/data/
+/dist/
+__pycache__/

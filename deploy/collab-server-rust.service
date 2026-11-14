@@ -1,0 +1,15 @@
+[Unit]
+Description=Editor Collaboration Rust server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/editor-collab-rust/collab-server -data /var/lib/editor-collab-rust
+EnvironmentFile=/etc/editor-collab-rust.env
+DynamicUser=yes
+StateDirectory=editor-collab-rust
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

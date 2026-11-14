@@ -1,22 +1,17 @@
 services:
-  collab-server:
+  collab-server-rust:
     build: .
-    image: editor-collaboration-server:latest
+    image: editor-collaboration-server-rust:local
     restart: unless-stopped
     ports:
-      # Loopback only. For a LAN, publish 0.0.0.0:7878:7878 and keep a real password. For the Internet, stay on
-      # loopback and terminate TLS in a reverse proxy (docs/internet.md).
-      - "127.0.0.1:7878:7878"
+      - "127.0.0.1:${COLLAB_PUBLISHED_PORT:-7878}:7878"
     environment:
-      # Required. Every collaborator enters it in Editor Preferences > Plugins > Editor Collaboration (personal).
-      # Set it in the shell or a .env file next to this compose file. There is no default.
       COLLAB_ROOM: ${COLLAB_ROOM:?Set COLLAB_ROOM to the plugin room name}
       COLLAB_PASSWORD: ${COLLAB_PASSWORD:?Set COLLAB_PASSWORD}
       COLLAB_PORT: "7878"
       COLLAB_MAX_ROOM_CLIENTS: "64"
     volumes:
-      # Database (collab.db): chat history, comments and modified files.
-      - collab-data:/data
+      - collab-rust-data:/data
 
 volumes:
-  collab-data:
+  collab-rust-data:

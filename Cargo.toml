@@ -1,0 +1,30 @@
+[package]
+name = "collab-server"
+version = "1.4.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+futures-util = "0.3"
+hex = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
+md5 = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_RemoteDesktop", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Globalization"] }
+
+[profile.release]
+strip = true
