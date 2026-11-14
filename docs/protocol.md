@@ -6,7 +6,7 @@ description: >-
 
 # Protocol
 
-Clients speak JSON over a WebSocket. The current protocol version is **6** (plugin 1.3, server 1.3), sent in `hello` and reported by `GET /health` as `protocolVersion`. A mismatch is refused with the error code `version`.
+Clients speak JSON over a WebSocket. The current protocol version is **9**, sent in `hello` and reported by `GET /health` as `protocolVersion`. A mismatch is refused with the error code `version`.
 
 {% hint style="info" %}
 This page is for anyone building or debugging a client. Day-to-day setup does not require it.
@@ -16,7 +16,7 @@ This page is for anyone building or debugging a client. Day-to-day setup does no
 
 | Message           | Role                                                                                          |
 | ----------------- | --------------------------------------------------------------------------------------------- |
-| `hello`           | Join a room. Fields: `protocolVersion`, `room`, `password`, `clientId`, `session`, `state`.   |
+| `hello`           | Join a room. Fields: `protocolVersion`, `room`, `password`, `clientId`, `session`, `engineVersion`, `commit`, `state`. |
 | `presence`        | Changed fields of `state`. A field set to `null` clears it.                                   |
 | `chat`            | Send `text`.                                                                                  |
 | `chat.history`    | Ask for older messages. `before` is the id of the oldest message already shown.               |
@@ -29,9 +29,16 @@ This page is for anyone building or debugging a client. Day-to-day setup does no
 | `asset.modify`    | File state. Fields: `package`, `asset`, `hash`, `dirty`, `working`.                           |
 | `asset.clear`     | Drop your record for a `package`.                                                             |
 | `ping`            | Look-here marker. Fields: `anchor`, `seconds`. Broadcast only. Not stored.                    |
+| `pkg.publish`     | A saved file, already uploaded. Fields: `package`, `hash`, `size`, `base` (Git commit), `revision`, `since`, optional `from`, `fromRevision` and `fromSince` for an atomic rename.       |
+| `pkg.delete`      | A deleted asset. Fields: `package`, `base`, `revision`.                                                            |
+| `ops`             | Live edits. Fields: `target`, `kind` (`level` or `graph`), `base`, `revision`, `operationId`, `ops`. See [Content sync](#content-sync). |
+| `ops.preview`     | A drag in progress. Fields: `target`, `revision`, `ops`. Relayed, not stored.                             |
+| `ops.sync`        | Catch up on a target. Fields: `target`, `revision`, `since`.                                              |
+| `graph.resync`    | Ask the others for a full copy of a Blueprint. Fields: `target`, `graph`, `revision`.                     |
+| `graph.snapshot`  | Answer to `graph.resync`. Fields: `target`, `graph`, `revision`, and `text` or `blob`.                    |
 
 ```json
-{"type":"hello","protocolVersion":6,"room":"MyProject","password":"...","clientId":"...","session":"...","state":{}}
+{"type":"hello","protocolVersion":9,"room":"MyProject","password":"...","clientId":"...","session":"...","engineVersion":"5.8.0","commit":"...","state":{}}
 ```
 
 Clients send at most 10 messages per second, and only when something changed. Past its limit, the server stops reading that client for a moment instead of dropping messages.
@@ -51,7 +58,7 @@ Two editors opened on the same copy of the project share one `authorId`, each wi
 
 ## Server to client
 
-On join, the server sends `welcome` (`selfId`, `authorId`, `protocolVersion`), `roster` (`peers`, each with `id`, `authorId`, and `state`), `chatHistory` (`messages`, `complete`), `comments`, and `assets` (`records`).
+On join, the server sends `welcome` (`selfId`, `authorId`, `protocolVersion`, `blobToken`), `roster` (`peers`, each with `id`, `authorId`, and `state`), `chatHistory` (`messages`, `complete`), `comments`, `assets` (`records`), and `packages` (`records`).
 
 | Message          | Role                                                                        |
 | ---------------- | --------------------------------------------------------------------------- |
@@ -64,13 +71,24 @@ On join, the server sends `welcome` (`selfId`, `authorId`, `protocolVersion`), `
 | `assetModified`  | One file record.                                                            |
 | `assetCleared`   | `package` and `author`.                                                     |
 | `ping`           | `id`, `anchor`, `authorId`, `author`, `color`, `at`, `seconds`.             |
+| `pkgPublished`   | One package `record`, with revision in `seq` and last compacted journal entry in `cutoff`.                |
+| `pkgDeleted`     | `package`, `authorId`, `revision`, `cutoff`, optional `to` for a rename. |
+| `opsAck`         | `target`, `operationId`, `seq`. Sent when a batch has already been committed. |
+| `opsApplied`     | `target`, `seq`, `revision`, `kind`, `authorId`, `senderId`, `operationId`, `ops`. Sent to everyone.               |
+| `opsPreview`     | `target`, `authorId`, `ops`. Not sent back to the author.                   |
+| `opsBatch`       | `target`, `since`, `revision`, `entries` (`seq`, `kind`, `authorId`, `ops`, `at`), `complete`. |
+| `graphResync`    | `target`, `graph`, `authorId`. Not sent back to the author.                 |
+| `graphSnapshot`  | `target`, `graph`, `authorId`, and `text` or `blob`. Sent to everyone.      |
+| `notice`         | `code`: `engine` or `commit` blocks content for a mixed room. `compatible` resumes content.           |
 | `error`          | `code`, `reason`, and a fallback English `message`.                         |
 
 `complete` is `true` when no older chat remains. Joining returns the last 100 messages. A room keeps its last 10,000 chat messages and accepts up to 2,000 comment threads. A thread holds 500 messages.
 
 ## State
 
-`state` fields: `name`, `color`, `map`, `cam`, `asset`, `graph`, `nodes`, `actors`, `active`, `pie`, `play`, `sequencer`, `branch`, `actorsMore`, `nodesMore`.
+`state` fields: `name`, `color`, `map`, `cam`, `asset`, `graph`, `nodes`, `actors`, `active`, `pie`, `play`, `sequencer`, `branch`, `liveBp`, `actorsMore`, `nodesMore`.
+
+`liveBp` is `true` when that editor has the experimental live Blueprint sync on.
 
 `branch` is the Git branch, or `null` when HEAD is detached. `actorsMore` and `nodesMore` count selected actors or nodes that were not sent, past the limit of 64.
 
@@ -105,6 +123,7 @@ A comment or ping `anchor.kind` is `map`, `graph`, or `asset`. An asset anchor l
 | `protocol` | Malformed message, or a `hello` without `clientId` or `session`.                                 |
 | `comment`  | Invalid comment, an edit or delete by someone other than the author, or a room at 2,000 threads. |
 | `storage`  | The server cannot read its database.                                                             |
+| `sync`     | A published file, op or snapshot names a blob that was not uploaded (reason `missingBlob`).      |
 
 The English `message` is a fallback. The Unreal plugin translates `code` into the editor language.
 
@@ -113,6 +132,20 @@ The English `message` is a fallback. The Unreal plugin translates `code` into th
 File records are kept per package and author. A record left under a name by an author who is not connected (a record from protocol 5, or from another copy of the project) is taken over by the next `asset.modify` or `asset.clear` under that name. Changing `name` moves the sender's records to the new name: `assetCleared` for the old one, then `assetModified`. A record not updated for 30 days is dropped.
 
 When the last editor with an `authorId` disconnects, the server clears its "I'm working on this" marks and broadcasts each one as `assetModified` with `working: false`. Git LFS locks are not stored on the server. Chat text may contain `[[comment:<id>]]`. The server stores that as text. The plugin turns it into a button when **Comment Links in Chat** is on.
+
+## Content sync
+
+Files go through HTTP on the same address: `PUT /blob/{md5}` and `GET /blob/{md5}`, with `Authorization: Bearer <blobToken>` from `welcome`. The body is the file, up to 256 MB. The server checks the MD5 and keeps blobs in `blobs` inside its data directory. A blob that nothing names anymore is removed after an hour.
+
+`ops` are appended to a journal per `target` (a long package name such as `/Game/Maps/Lobby`) and numbered by `seq`. Each successful `pkg.publish` advances the package revision and compacts entries through its `since` cutoff. Sequences persist independently of compacted rows. Later entries remain in the journal. `ops.sync` returns entries after `since` in pages when the client has the current `revision`. Ask again with the last applied `seq` until `complete` is `true`. A stale revision receives the current package record or `contentBaseline` when no saved file is available. A stale mutation receives `contentConflict`. The server commits the file record or operation before acknowledging it.
+
+Blob tokens are scoped to their room. A hash uploaded in one room cannot be read or referenced from another room unless the bytes were independently uploaded there. The server verifies upload bodies even when a matching blob already exists. Content is disabled while room members report different engine versions or Git commits. Presence, chat and comments remain available.
+
+Each op is an object with an `op` name of 64 characters at most. A message holds at most 64 ops and 48 KB of ops, and 64 KB in total. A bigger op is uploaded as a blob first and sent as `{"op":"...","blob":"<md5>","packed":true}`. Every `blob` named in an op, a record or a snapshot must already be on the server, or the message is refused with the `sync` error (reason `missingBlob`). Malformed ops are dropped. The server does not read the ops further; the plugin README lists them.
+
+## Upgrading from protocol 6
+
+Update the plugin and the server together. The database is kept, and the new tables are created on the first start.
 
 ## Upgrading from protocol 5
 

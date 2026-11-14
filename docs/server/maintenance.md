@@ -35,7 +35,9 @@ To restore: stop the server, replace `collab.db` with the copy, and delete `coll
 The plugin and the server exchange a protocol number. If they differ, the plugin shows "The plugin and server versions are incompatible: update one of them."
 
 {% hint style="warning" %}
-Plugin 1.3 and server 1.3 use protocol 6. Neither connects to a 1.2 version of the other, so update the server and every editor at the same time. `collab.db` is kept. Modified-file marks from 1.2 are taken over by their author on the next save or Git change. Comment messages written with 1.2 can no longer be edited.
+Update the server and every editor at the same time for protocol 9. Save in-progress work and back up the data directory first. Files and journal entries from protocol 7 are retained, but a fresh publication is needed for targets whose engine or Git base was never stored. `collab.db` is kept, and the content sync tables are added on the first start. Shared files are stored in `blobs` in the data directory: count them in backups and disk space.
+
+Coming from 1.2: modified-file marks are taken over by their author on the next save or Git change. Comment messages written with 1.2 can no longer be edited.
 {% endhint %}
 
 On startup, and then once a day, the server asks GitHub whether a [newer release](https://github.com/400Interactive/EditorCollaboration_Server/releases) exists. It writes a log line. On Windows it also shows a notification. Nothing is downloaded until you ask.
@@ -61,7 +63,7 @@ A Docker container only logs that a release exists. Update it with `docker compo
 | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | The Collaborators panel stays on "Connecting to ..."                      | Address, port, or firewall                                                                                 | Open `http://<server>:7878/health` from that person's PC. Check **Server URL** and the firewall. |
 | Wrong password.                                                           | The two passwords differ                                                                                   | **Password** in Editor Preferences must be exactly `COLLAB_PASSWORD`.                            |
-| The plugin and server versions are incompatible                           | Plugin and server at different versions, for example a 1.2 editor and a 1.3 server                         | Update both. See [Update](maintenance.md#update) above.                                          |
+| The plugin and server versions are incompatible                           | Plugin and server at different versions, for example a 1.3 editor and a 1.4 server                         | Update both. See [Update](maintenance.md#update) above.                                          |
 | The room is full.                                                         | `-max-room-clients` reached                                                                                | Raise the limit. The default is 64.                                                              |
 | `bind: Only one usage of each socket address` or `address already in use` | Another program, or another copy of the server, holds the port                                             | Stop the other one with `-stop`, or change the port with `-addr :7879`.                          |
 | `-detach` says a server is already running                                | Something already answers on that port                                                                     | `-stop` with the same `-data`, or keep the server that is already up.                            |

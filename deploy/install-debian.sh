@@ -176,6 +176,23 @@ ensure_password() {
 	write_password "$pass"
 }
 
+ensure_room() {
+	if [ -n "${COLLAB_ROOM:-}" ]; then
+		set_env_assignment COLLAB_ROOM "$COLLAB_ROOM"
+		return 0
+	fi
+	if [ -f "$ENV_FILE" ] && grep -Eq '^(COLLAB_ROOM|COLLAB_ROOM_PASSWORDS_FILE)=.' "$ENV_FILE"; then
+		return 0
+	fi
+	if ! ( : </dev/tty ) 2>/dev/null; then
+		die "Set COLLAB_ROOM to the room configured in Unreal."
+	fi
+	printf '%s' "Room name configured in Unreal: " >/dev/tty
+	IFS= read -r room </dev/tty || room=""
+	[ -n "$room" ] || die "The room name cannot be empty."
+	set_env_assignment COLLAB_ROOM "$room"
+}
+
 write_password() {
 	pass=$1
 	umask 077
@@ -545,6 +562,7 @@ install_server() {
 	info "Installing $INSTALL_BIN"
 	install -D -m 755 "$tmpdir/collab-server" "$INSTALL_BIN"
 	ensure_password
+	ensure_room
 	write_unit
 	sync_auto_update
 

@@ -29,9 +29,11 @@ To restore: with the server stopped, replace `collab.db` with the copy and delet
 The plugin and the server exchange a protocol number. If they do not match, the plugin shows "The plugin and
 server versions are incompatible: update one of them."
 
-Plugin 1.3 and server 1.3 use protocol 6 and do not connect to a 1.2 version of the other: update the server and
-every editor at the same time. `collab.db` is kept. Modified-file marks from 1.2 are taken over by their author on
-the next save or Git change. Comment messages written with 1.2 can no longer be edited.
+Plugin 1.4 and server 1.4 use protocol 9 and do not connect to a 1.3 version of the other: update the server and
+every editor at the same time. `collab.db` is kept, and the content sync tables are added on the first start.
+Shared files are stored in `blobs` in the data directory: count them in backups and disk space. Coming from 1.2:
+modified-file marks are taken over by their author on the next save or Git change, and comment messages written
+with 1.2 can no longer be edited.
 
 On startup, and then once a day, the server asks GitHub whether [a newer release](https://github.com/400Interactive/EditorCollaboration_Server/releases) exists. It only writes a log line (and, on Windows, a notification). Nothing is downloaded until you ask:
 
@@ -55,7 +57,7 @@ first start, then renamed to `.imported`.
 | --- | --- | --- |
 | The Collaborators panel stays on "Connecting to ..." | Address, port or firewall | Open `http://<server>:7878/health` from the collaborator's PC; check the **Server Url** and the firewall |
 | "Wrong password." | Different password | The **Password** in Editor Preferences must be exactly `COLLAB_PASSWORD` |
-| "The plugin and server versions are incompatible" | Plugin and server at different versions (for example a 1.2 editor and a 1.3 server) | Update both; see [Updating](#updating) |
+| "The plugin and server versions are incompatible" | Plugin and server at different versions (for example a 1.3 editor and a 1.4 server) | Update both; see [Updating](#updating) |
 | "The room is full." | `-max-room-clients` reached | Raise the limit (default 64) |
 | At startup: `bind: Only one usage of each socket address` or `address already in use` | Another program (or another server) uses the port | Stop the other server (`-stop`), or change the port (`-addr :7879`) |
 | `-detach`: "A server is already running" | A server already answers on that port | `-stop` with the same `-data`, or use the existing server |

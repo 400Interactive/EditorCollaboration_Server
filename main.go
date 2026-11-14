@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	version         = "1.3.0"
-	protocolVersion = 6
+	version         = "1.4.0"
+	protocolVersion = 9
 
 	maxMessageBytes = 64 << 10
 	maxRoomLength   = 128
@@ -58,27 +58,32 @@ var allowedFields = map[string]bool{
 	"name": true, "color": true, "map": true, "cam": true,
 	"asset": true, "graph": true, "nodes": true, "actors": true, "active": true,
 	"pie": true, "play": true, "sequencer": true, "branch": true, "actorsMore": true, "nodesMore": true,
+	"liveBp": true,
 }
 
 type config struct {
-	addr           string
-	password       string
-	tlsCert        string
-	tlsKey         string
-	maxRoomClients int
-	dataDir        string
-	logFile        string
-	noTray         bool
-	autoUpdate     bool
+	addr              string
+	password          string
+	roomPasswordsFile string
+	roomName          string
+	tlsCert           string
+	tlsKey            string
+	maxRoomClients    int
+	dataDir           string
+	logFile           string
+	noTray            bool
+	autoUpdate        bool
 }
 
 type server struct {
-	cfg          config
-	passwordHash [32]byte
+	cfg           config
+	passwordHash  [32]byte
+	roomPasswords map[string][32]byte
 
-	mu    sync.Mutex
-	rooms map[string]*room
-	db    *database
+	mu         sync.Mutex
+	rooms      map[string]*room
+	blobTokens map[string]*client
+	db         *database
 
 	// Set only by main: tests run without the -stop endpoint.
 	controlToken      string
@@ -128,23 +133,32 @@ func (rm *room) online(authorID string) bool {
 }
 
 type client struct {
-	id   string
-	name string
+	joinRoom string
+	joinName string
+	id       string
+	name     string
 	// author stamps chat, comments and modified-file records. It is derived from the secret client id the editor
 	// keeps across launches, so a reconnection or a restart keeps it, and the others cannot reuse it.
 	author string
 	// session is secret and changes at each editor launch.
 	session string
-	room    *room
-	conn  *websocket.Conn
-	send  chan []byte
-	state map[string]json.RawMessage
+	// blobToken authorizes PUT and GET /blob. It dies with the connection.
+	blobToken string
+	engine    string
+	commit    string
+	room      *room
+	conn      *websocket.Conn
+	send      chan []byte
+	state     map[string]json.RawMessage
 
 	closeOnce sync.Once
 	done      chan struct{}
 }
 
 type inbound struct {
+	OperationID     string                     `json:"operationId"`
+	FromSince       int64                      `json:"fromSince"`
+	FromRevision    int64                      `json:"fromRevision"`
 	Type            string                     `json:"type"`
 	ProtocolVersion int                        `json:"protocolVersion"`
 	Room            string                     `json:"room"`
@@ -164,6 +178,18 @@ type inbound struct {
 	Before          string                     `json:"before"`
 	ClientID        string                     `json:"clientId"`
 	Session         string                     `json:"session"`
+	EngineVersion   string                     `json:"engineVersion"`
+	Commit          string                     `json:"commit"`
+	Size            int64                      `json:"size"`
+	Base            string                     `json:"base"`
+	Target          string                     `json:"target"`
+	Kind            string                     `json:"kind"`
+	Revision        int64                      `json:"revision"`
+	Since           int64                      `json:"since"`
+	Ops             json.RawMessage            `json:"ops"`
+	Graph           string                     `json:"graph"`
+	From            string                     `json:"from"`
+	Blob            string                     `json:"blob"`
 }
 
 type peerEntry struct {
@@ -192,10 +218,23 @@ func main() {
 
 func run(cfg config) int {
 	setupLogging(cfg)
+	roomPasswords, err := loadRoomPasswords(cfg.roomPasswordsFile)
+	if err != nil {
+		log.Printf("room password configuration: %v", err)
+		return 1
+	}
+	if cfg.roomName != "" && (cfg.roomName != strings.TrimSpace(cfg.roomName) || utf8.RuneCountInString(cfg.roomName) > maxRoomLength) {
+		log.Print("Invalid COLLAB_ROOM or -room.")
+		return 1
+	}
+	if len(roomPasswords) == 0 && cfg.password != "" && cfg.roomName == "" {
+		log.Print("Set COLLAB_ROOM (or -room) for a shared password, or provide COLLAB_ROOM_PASSWORDS_FILE for multiple rooms.")
+		return 1
+	}
 	srv := &server{
-		cfg: cfg, passwordHash: sha256.Sum256([]byte(cfg.password)), rooms: map[string]*room{},
+		cfg: cfg, passwordHash: sha256.Sum256([]byte(cfg.password)), rooms: map[string]*room{}, blobTokens: map[string]*client{},
 		controlToken: newControlToken(), shutdownRequested: make(chan struct{}),
-		autoUpdate: cfg.autoUpdate,
+		autoUpdate: cfg.autoUpdate, roomPasswords: roomPasswords,
 	}
 	if err := os.MkdirAll(cfg.dataDir, 0o750); err != nil {
 		log.Print(err)
@@ -214,8 +253,9 @@ func run(cfg config) int {
 	}
 	defer db.close()
 	srv.db = db
+	srv.gcBlobs()
 
-	if cfg.password == "" && !listenHostIsLoopback(cfg.addr) {
+	if cfg.password == "" && len(roomPasswords) == 0 && !listenHostIsLoopback(cfg.addr) {
 		log.Print(T("server.passwordRequired"))
 		return 1
 	}
@@ -242,7 +282,7 @@ func run(cfg config) int {
 	log.Print(T("server.started", version, protocolVersion))
 	log.Print(T("server.listening", cfg.addr, scheme, portSuffix(cfg.addr)))
 	log.Print(T("server.data", filepath.Join(cfg.dataDir, databaseFileName)))
-	if cfg.password == "" {
+	if cfg.password == "" && len(roomPasswords) == 0 {
 		log.Print(T("server.noPassword"))
 	} else if cfg.tlsCert == "" {
 		log.Print(T("server.noTLS"))
@@ -299,6 +339,8 @@ func run(cfg config) int {
 func httpHandler(srv *server) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", srv.handleWebSocket)
+	mux.HandleFunc("PUT /blob/{hash}", srv.handleBlobPut)
+	mux.HandleFunc("GET /blob/{hash}", srv.handleBlobGet)
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc(controlPath, srv.handleShutdownRequest)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +357,12 @@ func httpHandler(srv *server) http.Handler {
 // left on the hijacked connection would close the session.
 func limitRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/ws" {
+		if strings.HasPrefix(r.URL.Path, "/blob/") {
+			deadline := time.Now().Add(10 * time.Minute)
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(deadline)
+			_ = rc.SetWriteDeadline(deadline)
+		} else if r.URL.Path != "/ws" {
 			deadline := time.Now().Add(15 * time.Second)
 			rc := http.NewResponseController(w)
 			_ = rc.SetReadDeadline(deadline)
@@ -383,6 +430,8 @@ func parseConfig() (config, command) {
 
 	var cfg config
 	flag.StringVar(&cfg.addr, "addr", net.JoinHostPort(host, port), "listen address (env COLLAB_HOST / COLLAB_PORT)")
+	flag.StringVar(&cfg.roomName, "room", os.Getenv("COLLAB_ROOM"), "restrict the shared password to a single room")
+	flag.StringVar(&cfg.roomPasswordsFile, "room-passwords", os.Getenv("COLLAB_ROOM_PASSWORDS_FILE"), "JSON file mapping allowed rooms to distinct passwords")
 	flag.StringVar(&cfg.password, "password", os.Getenv("COLLAB_PASSWORD"), "shared password required to join (env COLLAB_PASSWORD)")
 	flag.StringVar(&cfg.tlsCert, "tls-cert", os.Getenv("COLLAB_TLS_CERT"), "TLS certificate file, enables wss:// (env COLLAB_TLS_CERT)")
 	flag.StringVar(&cfg.tlsKey, "tls-key", os.Getenv("COLLAB_TLS_KEY"), "TLS private key file (env COLLAB_TLS_KEY)")
@@ -516,7 +565,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go c.writeLoop()
 	go c.pingLoop()
 
-	log.Print(T("server.joined", c.room.name, c.name, c.id, remoteHost(r)))
+	log.Print(T("server.joined", c.joinRoom, c.joinName, c.id, remoteHost(r)))
 	c.readLoop(r.Context(), s)
 }
 
@@ -538,14 +587,18 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 	if hello.ProtocolVersion != protocolVersion {
 		return nil, reject(conn, "version", fmt.Sprintf("Protocol version %d is not supported (server: %d). Update the plugin or the server.", hello.ProtocolVersion, protocolVersion))
 	}
-	given := sha256.Sum256([]byte(hello.Password))
-	if subtle.ConstantTimeCompare(given[:], s.passwordHash[:]) != 1 {
-		time.Sleep(500 * time.Millisecond)
-		return nil, reject(conn, "auth", "Wrong password.")
-	}
 	roomName := strings.TrimSpace(hello.Room)
 	if roomName == "" || utf8.RuneCountInString(roomName) > maxRoomLength {
 		return nil, reject(conn, "room", "Invalid room name.")
+	}
+	expected, allowed := s.passwordHash, s.cfg.roomName == "" || s.cfg.roomName == roomName
+	if s.roomPasswords != nil {
+		expected, allowed = s.roomPasswords[roomName]
+	}
+	given := sha256.Sum256([]byte(hello.Password))
+	if subtle.ConstantTimeCompare(given[:], expected[:]) != 1 || !allowed {
+		time.Sleep(500 * time.Millisecond)
+		return nil, reject(conn, "auth", "Wrong password.")
 	}
 	if !validClientKey(hello.ClientID) || !validClientKey(hello.Session) {
 		return nil, reject(conn, "protocol", "The hello message needs a clientId and a session.")
@@ -553,13 +606,16 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 
 	state := filterState(hello.State)
 	c := &client{
-		id:      newID(),
-		author:  authorID(hello.ClientID),
-		session: hello.Session,
-		conn:    conn,
-		send:    make(chan []byte, sendQueueSize),
-		state:   map[string]json.RawMessage{},
-		done:    make(chan struct{}),
+		id:        newID(),
+		author:    authorID(hello.ClientID),
+		session:   hello.Session,
+		conn:      conn,
+		send:      make(chan []byte, sendQueueSize),
+		state:     map[string]json.RawMessage{},
+		done:      make(chan struct{}),
+		blobToken: newID() + newID(),
+		engine:    cleanVersion(hello.EngineVersion),
+		commit:    cleanVersion(hello.Commit),
 	}
 	for key, value := range state {
 		if !isNull(value) {
@@ -567,26 +623,24 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 		}
 	}
 	c.name = displayName(c.state)
+	c.joinRoom, c.joinName = roomName, c.name
 
 	s.mu.Lock()
 	rm := s.rooms[roomName]
 	if rm == nil {
-		// The database is read without the server lock; another client may create the room meanwhile.
-		s.mu.Unlock()
+		if len(s.rooms) >= maxRooms {
+			s.mu.Unlock()
+			return nil, reject(conn, "full", "The server is hosting too many rooms.")
+		}
+		// Install the loaded snapshot in the same order as content commits.
 		loaded, err := s.db.loadRoom(roomName)
 		if err != nil {
+			s.mu.Unlock()
 			log.Print(T("server.loadRoom", roomName, err))
 			return nil, reject(conn, "storage", "The server cannot read its database.")
 		}
-		s.mu.Lock()
-		if rm = s.rooms[roomName]; rm == nil {
-			if len(s.rooms) >= maxRooms {
-				s.mu.Unlock()
-				return nil, reject(conn, "full", "The server is hosting too many rooms.")
-			}
-			rm = &room{name: roomName, clients: map[string]*client{}, data: loaded}
-			s.rooms[roomName] = rm
-		}
+		rm = &room{name: roomName, clients: map[string]*client{}, data: loaded}
+		s.rooms[roomName] = rm
 	}
 	saved := rm.data
 	var stale *client
@@ -618,11 +672,28 @@ func (s *server) handshake(ctx context.Context, conn *websocket.Conn) (*client, 
 		peers = append(peers, peerEntry{ID: other.id, AuthorID: other.author, State: copyState(other.state)})
 	}
 	// Queued while holding the lock so that no presence update can reach this client before its roster.
-	c.enqueue(mustJSON(map[string]any{"type": "welcome", "selfId": c.id, "authorId": c.author, "protocolVersion": protocolVersion}))
+	c.enqueue(mustJSON(map[string]any{"type": "welcome", "selfId": c.id, "authorId": c.author, "protocolVersion": protocolVersion, "blobToken": c.blobToken}))
 	c.enqueue(mustJSON(map[string]any{"type": "roster", "peers": peers}))
 	c.enqueue(mustJSON(map[string]any{"type": "chatHistory", "messages": saved.Chat, "complete": saved.ChatComplete}))
 	c.enqueue(mustJSON(map[string]any{"type": "comments", "comments": saved.Comments}))
 	c.enqueue(mustJSON(map[string]any{"type": "assets", "records": saved.Assets}))
+	if notice := sessionNotice(rm, c); notice != nil {
+		c.enqueue(mustJSON(notice))
+		queueBroadcast(rm, c.id, notice, &joined)
+		c.enqueue(mustJSON(map[string]any{"type": "packages", "records": []packageRecord{}}))
+	} else {
+		s.sendPackages(c, rm)
+		if stale != nil && (stale.engine != c.engine || stale.commit != c.commit) {
+			for _, peer := range rm.clients {
+				peer.enqueue(mustJSON(map[string]any{"type": "notice", "code": "compatible"}))
+				s.sendPackages(peer, rm)
+			}
+		}
+	}
+	if s.blobTokens == nil {
+		s.blobTokens = map[string]*client{}
+	}
+	s.blobTokens[c.blobToken] = c
 	c.room = rm
 	rm.clients[c.id] = c
 	queueBroadcast(rm, c.id, map[string]any{"type": "presence", "id": c.id, "authorId": c.author, "state": c.state}, &joined)
@@ -657,9 +728,18 @@ func (c *client) readLoop(ctx context.Context, s *server) {
 		}
 
 		// Past the limit, reading pauses instead of dropping: clients send only changes, so a lost one stays wrong.
+		var msg inbound
+		if json.Unmarshal(data, &msg) != nil {
+			continue
+		}
+
 		now := time.Now()
 		tokens = min(messageBurst, tokens+now.Sub(last).Seconds()*messagesPerSecond)
 		last = now
+		// Previews are dropped instead of pausing the connection: the next finalized op still arrives.
+		if msg.Type == "ops.preview" && tokens < 1 {
+			continue
+		}
 		if tokens < 1 {
 			select {
 			case <-time.After(time.Duration((1 - tokens) / messagesPerSecond * float64(time.Second))):
@@ -673,10 +753,6 @@ func (c *client) readLoop(ctx context.Context, s *server) {
 		}
 		tokens--
 
-		var msg inbound
-		if json.Unmarshal(data, &msg) != nil {
-			continue
-		}
 		switch msg.Type {
 		case "presence":
 			s.updatePresence(c, filterState(msg.State))
@@ -684,6 +760,10 @@ func (c *client) readLoop(ctx context.Context, s *server) {
 			s.handleCollab(c, msg)
 		case "chat.history":
 			s.sendOlderChat(c, msg.Before)
+		case "pkg.publish", "pkg.delete", "ops", "ops.preview", "graph.resync", "graph.snapshot":
+			s.handleSync(c, msg)
+		case "ops.sync":
+			s.answerOpsSync(c, msg.Target, msg.Since, msg.Revision)
 		}
 	}
 }
@@ -749,7 +829,11 @@ func (s *server) leave(c *client) {
 	s.mu.Lock()
 	var batch []delivery
 	var writes []func(*sql.Tx) error
+	if c.blobToken != "" {
+		delete(s.blobTokens, c.blobToken)
+	}
 	rm := c.room
+	empty := false
 	if rm != nil {
 		delete(rm.clients, c.id)
 		// Another editor launched from the same project copy has the same author id and keeps the marks.
@@ -761,14 +845,24 @@ func (s *server) leave(c *client) {
 		}
 		if len(rm.clients) == 0 {
 			delete(s.rooms, rm.name)
+			empty = true
 		} else {
 			queueBroadcast(rm, c.id, map[string]any{"type": "leave", "id": c.id}, &batch)
+			for _, peer := range rm.clients {
+				if (peer.engine != c.engine || peer.commit != c.commit) && sessionNotice(rm, peer) == nil {
+					peer.enqueue(mustJSON(map[string]any{"type": "notice", "code": "compatible"}))
+					s.sendPackages(peer, rm)
+				}
+			}
 		}
 		c.room = nil
 	}
 	deliver(batch)
 	s.mu.Unlock()
 	s.persist(writes)
+	if empty {
+		s.gcBlobs()
+	}
 
 	c.shutdown(websocket.StatusNormalClosure, "")
 	if rm != nil {
@@ -939,4 +1033,29 @@ func remoteHost(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+func loadRoomPasswords(path string) (map[string][32]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var entries map[string]string
+	if json.Unmarshal(data, &entries) != nil || len(entries) == 0 {
+		return nil, errors.New("expected a non-empty JSON object of room passwords")
+	}
+	rooms := make(map[string][32]byte, len(entries))
+	used := make(map[[32]byte]bool, len(entries))
+	for room, password := range entries {
+		hash := sha256.Sum256([]byte(password))
+		if room == "" || room != strings.TrimSpace(room) || utf8.RuneCountInString(room) > maxRoomLength ||
+			strings.TrimSpace(password) == "" || used[hash] {
+			return nil, errors.New("room names must be valid and passwords non-empty and distinct")
+		}
+		rooms[room], used[hash] = hash, true
+	}
+	return rooms, nil
 }

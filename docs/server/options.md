@@ -9,6 +9,8 @@ Every option exists as a command-line flag and as an environment variable.
 | Flag                    | Variable                            | Default                                      | Purpose                                                                                          |
 | ----------------------- | ----------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `-addr`                 | `COLLAB_HOST`, `COLLAB_PORT`        | `:7878` (all interfaces)                     | Listen address and port.                                                                         |
+| `-room` | `COLLAB_ROOM` | empty | Restricts the shared password to the matching Unreal room. Required in single-room password mode. |
+| `-room-passwords` | `COLLAB_ROOM_PASSWORDS_FILE` | empty | JSON file mapping allowed room names to distinct passwords. Overrides single-room mode. |
 | `-password`             | `COLLAB_PASSWORD`                   | empty                                        | Password required from clients. Set one.                                                         |
 | `-data`                 | `COLLAB_DATA_DIR`                   | `data`, relative to the current directory    | Database `collab.db`, logs, and the control file. Always pass an absolute path.                  |
 | `-log`                  | `COLLAB_LOG_FILE`                   | empty, or `<data>/server.log` with `-detach` | Also write logs to a file.                                                                       |

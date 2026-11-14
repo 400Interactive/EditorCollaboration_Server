@@ -30,7 +30,7 @@ Backups, updates and common problems: [maintenance.md](docs/maintenance.md).
 
    You can build on one machine and copy the executable to another: there is nothing else to install.
 
-2. **Pick a password** and share it with the collaborators (`COLLAB_PASSWORD`, or `-password`).
+2. **Configure a room and password** with `COLLAB_ROOM` and `COLLAB_PASSWORD` (or `-room` and `-password`). Use the effective room name from the Unreal project settings.
 3. **Start the server** with an absolute data directory (`-data`), see the guide for your platform.
 4. **Open port 7878** (TCP) in the machine's firewall.
 5. **Configure the plugin** in Unreal:
@@ -40,6 +40,16 @@ Backups, updates and common problems: [maintenance.md](docs/maintenance.md).
 
 To check that the server answers, open `http://<server address>:7878/health` in a browser: `{"status":"ok",...}`.
 
+For multiple independent rooms, set `COLLAB_ROOM_PASSWORDS_FILE` to a JSON file readable by the server.
+For example, `{"ProjectA":"secret-for-a","ProjectB":"secret-for-b"}`. Use a distinct, strong password for
+each room. Only listed rooms can join, and this file takes precedence over the single-room password.
+Docker Compose uses `COLLAB_ROOM` and `COLLAB_PASSWORD` for its single-room example.
+
+Protocol 9 requires a coordinated plugin and server update. Save live changes in Unreal and back up
+SQLite and the blobs directory before migrating. Saved packages and old journal rows are retained on migration. The server withholds old content
+without verified engine and Git metadata until someone publishes a fresh baseline.
+Publishing a fresh baseline replaces that target’s pre-upgrade journal.
+
 ## Server options
 
 Every option exists as a command-line argument and as an environment variable.
@@ -48,6 +58,8 @@ Every option exists as a command-line argument and as an environment variable.
 | --- | --- | --- | --- |
 | `-addr` | `COLLAB_HOST`, `COLLAB_PORT` | `:7878` (all interfaces) | Listen address and port |
 | `-password` | `COLLAB_PASSWORD` | empty | Password required from clients. Startup fails if it is empty unless `-addr` is loopback only (`127.0.0.1` or `::1`). Use `COLLAB_HOST=127.0.0.1` behind a TLS proxy. |
+| `-room` | `COLLAB_ROOM` | empty | Required with `-password` unless the room-password file is configured. |
+| `-room-passwords` | `COLLAB_ROOM_PASSWORDS_FILE` | empty | Path to a JSON object mapping allowed rooms to distinct passwords. |
 | `-data` | `COLLAB_DATA_DIR` | `data` (relative to the current directory) | Database `collab.db`, logs, control file |
 | `-log` | `COLLAB_LOG_FILE` | empty (`<data>/server.log` with `-detach`) | Also write the logs to a file |
 | `-tls-cert`, `-tls-key` | `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | empty | Direct HTTPS (`wss://`), see [internet.md](docs/internet.md) |

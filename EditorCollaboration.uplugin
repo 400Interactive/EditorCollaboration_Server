@@ -1,14 +1,13 @@
 {
 	"FileVersion": 3,
 	"Version": 2,
-	"VersionName": "1.3",
+	"VersionName": "1.4",
 	"FriendlyName": "Editor Collaboration",
 	"Description": "Real-time collaboration in the editor: see where your teammates are (map, viewport, Blueprint, Material...), join them in one click, chat, pin comments and see which assets they changed. Editor only.",
 	"Category": "Editor",
 	"CreatedBy": "Kinj14",
 	"CreatedByURL": "https://400interactive.com/",
 	"DocsURL": "https://app.gitbook.com/o/pyX1jisZK86abtXxrbQm/sites/site_TGEKx/preview",
-	"MarketplaceURL": "https://www.fab.com/portal/listings/562248b3-2a46-4076-ba0d-b812b4d7d659/",
 	"SupportURL": "https://discord.400interactive.com/",
 	"CanContainContent": false,
 	"IsBetaVersion": false,
@@ -24,9 +23,31 @@
 		{
 			"Name": "LevelSequenceEditor",
 			"Enabled": true
+		},
+		{
+			"Name": "ConcertMain",
+			"Enabled": true
+		},
+		{
+			"Name": "ConcertSyncCore",
+			"Enabled": true
+		},
+		{
+			"Name": "FileSandbox",
+			"Enabled": true
 		}
 	],
 	"Modules": [
+		{
+			"Name": "EditorCollabMiniupnpc",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		},
 		{
 			"Name": "EditorCollaboration",
 			"Type": "Editor",

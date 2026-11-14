@@ -16,7 +16,7 @@ Every collaborator connects to one small server. It is a single executable. SQLi
 
 {% stepper %}
 {% step %}
-From the server repository, run `./build.ps1` on Windows or `./build.sh` on Linux and Mac. You need [Go](https://go.dev/dl/) or Docker. The binaries land in `dist/`.
+Plugin 1.4 requires server 1.4.0 (protocol 9). Download your binary from the [1.4.0 release](https://github.com/400Interactive/EditorCollaboration_Server/releases/tag/v1.4.0). To build from source, run `./build.ps1` on Windows or `./build.sh` on Linux and Mac. You need [Go](https://go.dev/dl/) or Docker. The binaries land in `dist/`.
 
 | File                              | Machine                                          |
 | --------------------------------- | ------------------------------------------------ |
@@ -30,7 +30,7 @@ You can build on one machine and copy the executable to another.
 {% endstep %}
 
 {% step %}
-Set `COLLAB_PASSWORD`, or pass `-password`. Share that password with the people who will connect. An empty password is accepted, and it is a bad idea as soon as the port is reachable.
+Set `COLLAB_PASSWORD`, or pass `-password`. Share that password with the people who will connect. Set the room with `COLLAB_ROOM` or `-room` when using one shared password. The server only allows an empty password when listening on loopback.
 {% endstep %}
 
 {% step %}

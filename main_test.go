@@ -13,7 +13,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-func newTestServer(t *testing.T, password string, dataDir string) (*httptest.Server, *server) {
+func newTestServer(t *testing.T, password string, dataDir string, roomPasswords ...map[string][32]byte) (*httptest.Server, *server) {
 	t.Helper()
 	db, err := openDatabase(dataDir)
 	if err != nil {
@@ -24,7 +24,11 @@ func newTestServer(t *testing.T, password string, dataDir string) (*httptest.Ser
 		cfg:          config{password: password, maxRoomClients: 8, dataDir: dataDir},
 		passwordHash: sha256.Sum256([]byte(password)),
 		rooms:        map[string]*room{},
+		blobTokens:   map[string]*client{},
 		db:           db,
+	}
+	if len(roomPasswords) > 0 {
+		srv.roomPasswords = roomPasswords[0]
 	}
 	ts := httptest.NewServer(httpHandler(srv))
 	t.Cleanup(ts.Close)
@@ -86,6 +90,7 @@ func hello(room, password, name string) map[string]any {
 }
 
 type joined struct {
+	blobToken    string
 	conn         *websocket.Conn
 	id           string
 	author       string
@@ -94,6 +99,7 @@ type joined struct {
 	chatComplete bool
 	comments     []any
 	assets       []any
+	packages     []any
 }
 
 func join(t *testing.T, ts *httptest.Server, room, password, name string) joined {
@@ -108,6 +114,7 @@ func joinWith(t *testing.T, ts *httptest.Server, greeting map[string]any) joined
 	j := joined{conn: conn}
 	welcome := expect(t, conn, "welcome")
 	j.id = welcome["selfId"].(string)
+	j.blobToken = welcome["blobToken"].(string)
 	j.author = welcome["authorId"].(string)
 	j.peers = expect(t, conn, "roster")["peers"].([]any)
 	history := expect(t, conn, "chatHistory")
@@ -115,6 +122,9 @@ func joinWith(t *testing.T, ts *httptest.Server, greeting map[string]any) joined
 	j.chatComplete = history["complete"].(bool)
 	j.comments = expect(t, conn, "comments")["comments"].([]any)
 	j.assets = expect(t, conn, "assets")["records"].([]any)
+	if records, ok := expect(t, conn, "packages")["records"].([]any); ok {
+		j.packages = records
+	}
 	return j
 }
 

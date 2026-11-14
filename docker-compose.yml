@@ -10,6 +10,7 @@ services:
     environment:
       # Required. Every collaborator enters it in Editor Preferences > Plugins > Editor Collaboration (personal).
       # Set it in the shell or a .env file next to this compose file. There is no default.
+      COLLAB_ROOM: ${COLLAB_ROOM:?Set COLLAB_ROOM to the plugin room name}
       COLLAB_PASSWORD: ${COLLAB_PASSWORD:?Set COLLAB_PASSWORD}
       COLLAB_PORT: "7878"
       COLLAB_MAX_ROOM_CLIENTS: "64"

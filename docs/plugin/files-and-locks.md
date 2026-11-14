@@ -4,7 +4,7 @@ description: Pencils for files someone else changed, soft locks, and Git LFS loc
 
 # Files and locks
 
-Git still moves the bytes. The plugin only tells you who is touching a file, and can hold a lock so two people do not save over each other.
+Git remains the source of truth. The plugin shows who is touching a file and can hold a lock. Optional content sync sends saved assets and live map edits through your server. With the sandbox enabled, review changes and select **Integrate** before committing them to Git. Live Blueprint, Landscape and Foliage sync are experimental.
 
 ## Pencil: someone else changed it
 

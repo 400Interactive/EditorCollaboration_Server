@@ -68,6 +68,74 @@ CREATE TABLE IF NOT EXISTS assets (
 	at        INTEGER NOT NULL,
 	PRIMARY KEY (room, package, author)
 );
+
+CREATE TABLE IF NOT EXISTS packages (
+	room      TEXT NOT NULL,
+	package   TEXT NOT NULL,
+	hash      TEXT NOT NULL,
+	size      INTEGER NOT NULL,
+	base      TEXT NOT NULL,
+	author_id TEXT NOT NULL,
+	author    TEXT NOT NULL,
+	color     TEXT NOT NULL,
+	seq       INTEGER NOT NULL,
+	at        INTEGER NOT NULL,
+	PRIMARY KEY (room, package)
+);
+
+CREATE TABLE IF NOT EXISTS ops (
+	room      TEXT NOT NULL,
+	target    TEXT NOT NULL,
+	seq       INTEGER NOT NULL,
+	kind      TEXT NOT NULL,
+	author_id TEXT NOT NULL,
+	ops       TEXT NOT NULL,
+	at        INTEGER NOT NULL,
+	PRIMARY KEY (room, target, seq)
+);
+CREATE INDEX IF NOT EXISTS ops_by_target ON ops(room, target, seq);
+
+CREATE TABLE IF NOT EXISTS content_heads (
+	room TEXT NOT NULL,
+	target TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	revision INTEGER NOT NULL,
+	cutoff INTEGER NOT NULL,
+	base TEXT NOT NULL,
+	engine TEXT NOT NULL,
+	PRIMARY KEY(room, target)
+);
+
+CREATE TABLE IF NOT EXISTS op_receipts (
+    room TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY(room, author_id, operation_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS op_receipts_by_sequence ON op_receipts(room,target,seq);
+
+CREATE TABLE IF NOT EXISTS package_removals (
+    room TEXT NOT NULL,
+    package TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    renamed_to TEXT NOT NULL,
+    PRIMARY KEY(room, package)
+);
+
+CREATE TABLE IF NOT EXISTS room_blobs (
+	room TEXT NOT NULL,
+	hash TEXT NOT NULL,
+	PRIMARY KEY(room, hash)
+);
+
+CREATE TABLE IF NOT EXISTS blobs (
+	hash TEXT PRIMARY KEY,
+	size INTEGER NOT NULL,
+	at   INTEGER NOT NULL
+);
 `
 
 // assetRecord is the last known state of one package file on one collaborator's machine.
@@ -148,7 +216,7 @@ func openDatabase(dir string) (*database, error) {
 		return nil, fmt.Errorf("cannot create data directory %q: %w", dir, err)
 	}
 	path := filepath.Join(dir, databaseFileName)
-	pragmas := "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(10000)&_pragma=temp_store(MEMORY)"
+	pragmas := "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(10000)&_pragma=temp_store(MEMORY)"
 	handle, err := sql.Open("sqlite", path+pragmas)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open %s: %w", path, err)
@@ -158,6 +226,23 @@ func openDatabase(dir string) (*database, error) {
 		return nil, fmt.Errorf("cannot prepare %s: %w", path, err)
 	}
 	if err := ensureColumn(handle, "assets", "working", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		handle.Close()
+		return nil, err
+	}
+	for _, column := range []struct{ name, decl string }{
+		{"cutoff", "INTEGER NOT NULL DEFAULT 0"},
+		{"engine", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureColumn(handle, "packages", column.name, column.decl); err != nil {
+			handle.Close()
+			return nil, err
+		}
+	}
+	if err := ensureColumn(handle, "blobs", "strong_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		handle.Close()
+		return nil, err
+	}
+	if err := migrateContent(handle); err != nil {
 		handle.Close()
 		return nil, err
 	}
@@ -262,6 +347,7 @@ type roomData struct {
 	Chat         []chatMessage
 	ChatComplete bool
 	Assets       []assetRecord
+	Packages     []packageRecord
 	// pending is drained by the caller after it releases server.mu, so a full write queue cannot stall every room.
 	pending []func(tx *sql.Tx) error
 }
@@ -304,7 +390,7 @@ func (d *database) loadRoom(name string) (*roomData, error) {
 	// Includes the writes of a previous session of the same room that may still be queued.
 	d.flush()
 
-	data := &roomData{db: d, name: name, Comments: []*comment{}, Assets: []assetRecord{}}
+	data := &roomData{db: d, name: name, Comments: []*comment{}, Assets: []assetRecord{}, Packages: []packageRecord{}}
 	var err error
 	if data.Chat, data.ChatComplete, err = d.chatPage(name, ""); err != nil {
 		return nil, err
@@ -336,15 +422,37 @@ func (d *database) loadRoom(name string) (*roomData, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var r assetRecord
 		if err := rows.Scan(&r.Package, &r.Asset, &r.Hash, &r.Dirty, &r.Working, &r.AuthorID, &r.Author, &r.Color, &r.At); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		data.Assets = append(data.Assets, r)
 	}
-	return data, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	rows, err = d.sql.Query(`SELECT package, hash, size, base, author_id, author, color, seq, at, cutoff, engine FROM packages WHERE room = ? ORDER BY at`, name)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var r packageRecord
+		if err := rows.Scan(&r.Package, &r.Hash, &r.Size, &r.Base, &r.AuthorID, &r.Author, &r.Color, &r.Seq, &r.At, &r.Cutoff, &r.Engine); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		data.Packages = append(data.Packages, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return data, nil
 }
 
 // chatPage returns up to chatPageSize messages older than beforeID (the latest ones when empty), oldest first,
